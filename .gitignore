@@ -1,0 +1,16 @@
+# Python virtualenv / cache
+HanDan/.venv/
+HanDan/__pycache__/
+
+# PyInstaller build output (rebuild via HanDan/菡萏咖啡存摺.spec)
+HanDan/build/
+HanDan/dist/
+HanDan/菡萏咖啡存摺.exe
+
+# Personal financial data — never commit
+HanDan/菡萏咖啡.xlsx
+HanDan/菡萏咖啡_手操版.xlsx
+HanDan/~$*.xlsx
+
+# Claude Code local-machine settings
+.claude/settings.local.json
