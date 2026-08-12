@@ -14,3 +14,11 @@ HanDan/~$*.xlsx
 
 # Claude Code local-machine settings
 .claude/settings.local.json
+
+# 手機版建置產物與抓價備份（由 build_mobile.py / fetch_close.py 重新產生）
+HanDan/菡萏咖啡-手機版.html
+HanDan/*.bak
+
+# 瀏覽器編輯內容的鏡像，含個人財務資料，由 serve.py 自動寫入
+HanDan/mobile_state.json
+HanDan/mobile_state.json.tmp
