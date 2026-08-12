@@ -34,6 +34,7 @@ from pathlib import Path
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # --- 設定 ---------------------------------------------------------------
 
@@ -44,6 +45,9 @@ TPEX_JSON = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quote
 # 收盤後常要等一兩小時才處理完當天資料，但這個引擎在收盤當下（最後成交時間
 # 13:30:00）就已經反映最後成交價，可以更快拿到當日收盤價，用來補上還沒更新的部分。
 MIS_QUOTE_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+# 即時報價引擎單次查詢的檔數有上限，超過會整批查不到；同一代號要查上市與
+# 上櫃兩種前綴，目標數是持股檔數的兩倍，因此分批送出。
+MIS_BATCH_SIZE = 40
 
 # 興櫃股票屬櫃買中心另一組資料集，主板端點不涵蓋。
 # 端點名稱歷經改版，逐一嘗試直到取得資料。
@@ -54,7 +58,16 @@ TPEX_ESB_URLS = [
 ]
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/csv, */*"}
-TIMEOUT = 20
+# 證交所的每日完整 CSV 有一千多檔，尖峰時段回應常常拖過 20 秒；逾時會讓
+# 整個抓價流程拋例外，網頁端只會看到一個沒有頭緒的「HTTP 500」。放寬秒數
+# 並自動重試，把間歇性的慢回應吸收掉。
+TIMEOUT = 45
+_RETRY = Retry(
+    total=2, connect=2, read=2,
+    backoff_factor=1.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET"]),
+)
 
 
 class _RelaxedCertAdapter(HTTPAdapter):
@@ -71,7 +84,12 @@ class _RelaxedCertAdapter(HTTPAdapter):
 
 
 _tpex_session = requests.Session()
-_tpex_session.mount("https://www.tpex.org.tw", _RelaxedCertAdapter())
+_tpex_session.mount("https://www.tpex.org.tw", _RelaxedCertAdapter(max_retries=_RETRY))
+
+# TWSE 與其餘來源共用，統一帶上重試策略
+_session = requests.Session()
+_session.mount("https://", HTTPAdapter(max_retries=_RETRY))
+_session.mount("http://", HTTPAdapter(max_retries=_RETRY))
 
 # 持倉清單。ETF 直接用代號；個股為「中文名: 代號」。
 # 代號皆已比對證交所官方檔案的「證券代號／證券名稱」欄位。
@@ -129,7 +147,7 @@ def fetch_twse_dated(d: datetime) -> tuple[dict[str, float], str]:
     故沿用同一套解析方式。
     """
     url = TWSE_DATED.format(ymd=d.strftime("%Y%m%d"))
-    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+    r = _session.get(url, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
     r.encoding = "utf-8"
     reader = csv.reader(io.StringIO(r.text))
@@ -152,7 +170,7 @@ def fetch_twse_dated(d: datetime) -> tuple[dict[str, float], str]:
 
 def fetch_twse_latest() -> tuple[dict[str, float], str]:
     """抓取上市最新一期收盤價（不指定日期），回傳價格與資料日期。"""
-    r = requests.get(TWSE_CSV, headers=HEADERS, timeout=TIMEOUT)
+    r = _session.get(TWSE_CSV, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
     r.encoding = "utf-8"
     reader = csv.reader(io.StringIO(r.text))
@@ -251,41 +269,52 @@ def fetch_tpex() -> tuple[dict[str, float], str]:
     return _parse_quotes(rows), _extract_date(rows)
 
 
-def fetch_tpex_realtime(codes: list[str]) -> tuple[dict[str, float], str]:
-    """用上市櫃共用的即時報價引擎補上還沒進到官方批次檔的上櫃收盤價。
+def fetch_realtime_quotes(codes: list[str]) -> tuple[dict[str, float], str]:
+    """用上市櫃共用的即時報價引擎取得當日最後成交價。
 
-    以 `otc_<代號>.tw` 查詢，一次可查多檔（用 | 分隔）；查詢的代號若其實是
-    上市（TWSE）商品，這個引擎會直接不回傳該筆，不會出錯，所以呼叫端不需要
-    先篩選「哪些代號是上櫃的」，把整份追蹤清單丟進來即可，只有真的查得到的
-    才會出現在回傳結果裡。回傳 (價格, 資料日期)。
+    官方每日批次檔要到收盤後一段時間才產出（實測 13:55 仍是前一交易日的
+    資料），剛收盤就抓價會拿到昨天的數字；這個引擎在收盤當下就已反映最後
+    成交價，用來補上當天的價格。
+
+    同一代號同時以 `tse_<代號>.tw` 與 `otc_<代號>.tw` 兩種前綴查詢，引擎只
+    會回傳實際存在的那一筆（另一筆的成交價欄位是 "-"，會被下面的檢查濾掉），
+    因此呼叫端不需要先分辨商品屬於上市還是上櫃，把整份追蹤清單丟進來即可。
+
+    單次查詢的檔數有上限，超過會整批查不到，所以分批送出。
+    回傳 (價格, 資料日期)。
     """
     if not codes:
         return {}, ""
-    ex_ch = "|".join(f"otc_{c}.tw" for c in codes)
-    r = requests.get(MIS_QUOTE_URL, params={"ex_ch": ex_ch, "json": "1", "delay": "0"},
-                      headers=HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
-    # 回應前面夾雜大量空白/換行（防爬蟲雜訊），JSON 本體從第一個 { 開始。
-    text = r.text
-    start = text.find("{")
-    if start < 0:
-        return {}, ""
-    data = json.loads(text[start:])
 
+    targets = [f"{market}_{c}.tw" for c in codes for market in ("tse", "otc")]
     prices: dict[str, float] = {}
     date = ""
-    for row in data.get("msgArray", []):
-        code = row.get("c")
-        z = row.get("z")  # 最後成交價；收盤後即為當日收盤價。
-        if not code or not z or z == "-":
+
+    for i in range(0, len(targets), MIS_BATCH_SIZE):
+        params = {"ex_ch": "|".join(targets[i:i + MIS_BATCH_SIZE]),
+                  "json": "1", "delay": "0"}
+        r = _session.get(MIS_QUOTE_URL, params=params, headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        # 回應前面夾雜大量空白/換行（防爬蟲雜訊），JSON 本體從第一個 { 開始。
+        text = r.text
+        start = text.find("{")
+        if start < 0:
             continue
-        try:
-            value = float(z)
-        except ValueError:
-            continue
-        if value > 0:
-            prices[code] = value
-            date = date or row.get("d", "")
+        data = json.loads(text[start:])
+
+        for row in data.get("msgArray", []):
+            code = row.get("c")
+            z = row.get("z")  # 最後成交價；收盤後即為當日收盤價。
+            if not code or not z or z == "-":
+                continue
+            try:
+                value = float(z)
+            except ValueError:
+                continue
+            if value > 0:
+                prices[code] = value
+                date = date or (row.get("d") or "")
+
     return prices, date
 
 
@@ -444,17 +473,40 @@ def main() -> int:
     print(f"[結果] 上市 {len(twse)} 檔、上櫃 {len(tpex)} 檔、興櫃 {len(esb)} 檔，來源：{source}")
 
     iso_date = roc_to_iso(raw_date) or target.strftime("%Y-%m-%d")
+    target_iso = target.strftime("%Y-%m-%d")
+    tracked = sorted(set(ETF_CODES) | set(STOCK_CODE_MAP.values()))
 
     print(f"[結果] 實際資料日期：{iso_date}")
-    if iso_date != target.strftime("%Y-%m-%d"):
-        print(f"[警告] 實際資料日期與目標取價日 {target:%Y-%m-%d} 不符，可能為國定假日休市或來源尚未更新。")
+
+    # 官方每日檔要到收盤後一段時間才產出（實測 13:55 仍回前一交易日的資料），
+    # 這時上市與上櫃兩邊都是舊的、彼此一致，靠來源互比看不出問題，收盤後隨即
+    # 抓價就只會拿到昨天的數字。只要已收盤卻拿到舊日期，就直接用即時報價引擎
+    # （收盤當下即反映最後成交價）補上當日價。
+    realtime_applied = False
+    if not before_close and iso_date != target_iso:
+        try:
+            rt_prices, rt_date = fetch_realtime_quotes(tracked)
+        except Exception as exc:  # noqa: BLE001
+            rt_prices, rt_date = {}, ""
+            print(f"[警告] 即時報價備援抓取失敗（{type(exc).__name__}: {exc}）")
+        if rt_prices and roc_to_iso(rt_date) == target_iso:
+            prices.update(rt_prices)
+            print(f"[結果] 官方每日檔仍為 {iso_date}，已用即時報價補上 "
+                  f"{len(rt_prices)} 檔 {target_iso} 收盤價。")
+            iso_date = target_iso
+            realtime_applied = True
+        else:
+            print(f"[警告] 實際資料日期與目標取價日 {target_iso} 不符，"
+                  "可能為國定假日休市，或官方檔與即時報價都尚未更新。")
+    elif iso_date != target_iso:
+        print(f"[警告] 實際資料日期與目標取價日 {target_iso} 不符，可能為國定假日休市或來源尚未更新。")
 
     # 上市（TWSE）與上櫃／興櫃（TPEx）是各自獨立的來源，收盤後更新的時間點不一定一致；
     # 只看 TWSE 的日期會誤以為全部資料都是當日的，因此個別比對。
-    if tpex and roc_to_iso(tpex_date) != iso_date:
-        tracked = sorted(set(ETF_CODES) | set(STOCK_CODE_MAP.values()))
+    # 上面若已整批補過當日價就不必再補一次。
+    if not realtime_applied and tpex and roc_to_iso(tpex_date) != iso_date:
         try:
-            rt_prices, rt_date = fetch_tpex_realtime(tracked)
+            rt_prices, rt_date = fetch_realtime_quotes(tracked)
         except Exception as exc:  # noqa: BLE001
             rt_prices, rt_date = {}, ""
             print(f"[警告] 即時報價備援抓取失敗（{type(exc).__name__}: {exc}）")

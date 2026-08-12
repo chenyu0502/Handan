@@ -659,6 +659,45 @@ function storageBackendLabel() {
   return '僅暫存於本次瀏覽（不會保留）';
 }
 
+// 把目前瀏覽器儲存的內容鏡像一份給 serve.py（存成 mobile_state.json）。
+// 手動編輯只活在這台瀏覽器的 localStorage 裡，外部程式讀不到，少了這份鏡像，
+// 「更新手機版」就打包不到使用者的修改，手機上會看到和電腦不同的數字。
+// 只在透過 serve.py 開啟時作用：直接開檔、或在手機版開啟都會自動略過，
+// 連線失敗也只是靜默跳過，不影響頁面任何操作。
+let stateMirrorTimer = null;
+
+function scheduleStateMirror() {
+  if (window.__HANDAN_MOBILE__) return;
+  if (!location.protocol.startsWith('http')) return;
+  clearTimeout(stateMirrorTimer);
+  stateMirrorTimer = setTimeout(mirrorStateToServer, 600);
+}
+
+async function mirrorStateToServer() {
+  const dump = {};
+  if (storageBackend === 'local') {
+    for (let i = 0; i < localStorage.length; i++) {
+      const raw = localStorage.key(i);
+      if (raw && raw.startsWith(LS_PREFIX)) {
+        dump[raw.slice(LS_PREFIX.length)] = localStorage.getItem(raw);
+      }
+    }
+  } else if (storageBackend === 'memory') {
+    for (const [k, v] of memoryStore) dump[k] = v;
+  } else {
+    return;
+  }
+  try {
+    await fetch('/api/save-state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ savedAt: new Date().toISOString(), data: dump }),
+    });
+  } catch (e) {
+    // serve.py 沒開著就略過，這不是錯誤情境
+  }
+}
+
 async function storageGet(key, shared) {
   if (storageBackend === 'claude') return window.storage.get(key, shared);
   if (storageBackend === 'local') {
@@ -674,9 +713,11 @@ async function storageSet(key, value, shared) {
   if (storageBackend === 'claude') return window.storage.set(key, value, shared);
   if (storageBackend === 'local') {
     localStorage.setItem(LS_PREFIX + key, value);
+    scheduleStateMirror();
     return { key, value, shared: !!shared };
   }
   memoryStore.set(key, value);
+  scheduleStateMirror();
   return { key, value, shared: !!shared };
 }
 
@@ -684,9 +725,11 @@ async function storageDelete(key, shared) {
   if (storageBackend === 'claude') return window.storage.delete(key, shared);
   if (storageBackend === 'local') {
     localStorage.removeItem(LS_PREFIX + key);
+    scheduleStateMirror();
     return { key, deleted: true, shared: !!shared };
   }
   memoryStore.delete(key);
+  scheduleStateMirror();
   return { key, deleted: true, shared: !!shared };
 }
 
@@ -1557,23 +1600,25 @@ const STOCK_CODE_MAP = {
 };
 
 // 由 Claude 從證交所官方盤後檔案取得後內建於此（頁面本身無法對外連線）。
-const EMBEDDED_PRICES_DATE = '2026-07-30';
+const EMBEDDED_PRICES_DATE = '2026-08-11';
 const EMBEDDED_PRICES = {
   // ETF
-  '0050': 93.5, '0056': 46.29, '00403A': 8.47, '00679B': 26.51, '00687B': 27.6, '00713': 60.3,
-  '00720B': 32.16, '00878': 30.75, '00888': 28.61, '00891': 30.19, '00900': 17.55,
-  '00904': 34.16, '00915': 30.07, '00917': 23.83, '00919': 28.25, '00929': 26, '00934': 25.35,
-  '00937B': 14.51, '00939': 21.41, '00940': 11.52, '00942B': 13.98, '00944': 19.06,
-  '00945B': 14.65, '00950B': 13.96, '00980A': 19.56, '00981A': 23.76, '00982A': 18.54,
-  '00984A': 13.27, '00992A': 13.48,
+  '0050': 104.6, '0056': 52.3, '00403A': 9.94, '00679B': 26.32, '00687B': 27.39,
+  '00713': 61.05, '00720B': 32.19, '00878': 33.47, '00888': 32.59, '00891': 35.46,
+  '00900': 18.73, '00904': 40, '00915': 31.91, '00917': 24.28, '00919': 30.12, '00929': 29.17,
+  '00934': 28.58, '00937B': 14.55, '00939': 22.26, '00940': 12.34, '00942B': 13.97,
+  '00944': 20.9, '00945B': 14.7, '00950B': 13.85, '00980A': 24.29, '00981A': 28.73,
+  '00982A': 22.5, '00984A': 15.18, '00992A': 16.96,
   // 個股
-  '1303': 145, '1453': 11, '1536': 45, '1605': 28.6, '1612': 29.6, '1616': 18, '1711': 29.2,
-  '1721': 18.1, '2303': 110, '2328': 38.8, '2330': 2205, '2337': 91.8, '2342': 29.95,
-  '2353': 27.9, '2359': 123.5, '2363': 44.8, '2367': 33.4, '2371': 23.5, '2501': 22.4,
-  '2520': 35.1, '2603': 201, '2883': 28.95, '2884': 37.7, '3060': 25.4, '3231': 160,
-  '3481': 41.4, '4306': 14.05, '4967': 212.5, '6177': 47.45, '6239': 214.5, '6282': 38.85,
-  '6558': 22.6, '6770': 49.55
+  '1303': 190, '1453': 11, '1536': 51.2, '1605': 38.3, '1612': 34, '1616': 19.6, '1711': 37.85,
+  '1721': 19.8, '2303': 123, '2328': 46.1, '2330': 2395, '2337': 132.5, '2342': 37.05,
+  '2353': 31.05, '2359': 140.5, '2363': 57, '2367': 44.75, '2371': 25.95, '2501': 22.45,
+  '2520': 34.45, '2603': 218, '2883': 31.05, '2884': 36.9, '3060': 28.8, '3231': 191,
+  '3323': 32.2, '3481': 50.1, '3680': 445, '4306': 14.3, '4967': 274.5, '6177': 48.25,
+  '6239': 282.5, '6282': 49.85, '6558': 26.8, '6770': 67, '7907': 202, '8046': 1150,
+  '8374': 82.2, '8936': 52
 };
+
 
 function parseCode(code) {
   const m = /^(\d+)([A-Za-z]*)$/.exec(code || '');
@@ -1654,7 +1699,15 @@ async function fetchClosePrice(statusEl, syncXlsx = false) {
           liveError = data.error || '未知錯誤';
         }
       } else {
-        liveError = `HTTP ${res.status}`;
+        // 後端回非 2xx 時，body 裡通常已寫明真正原因（連線證交所逾時、
+        // Excel 被其他程式鎖住等）。只顯示狀態碼會讓人無從判斷，
+        // 這裡把細節一併取出。
+        let detail = '';
+        try {
+          const body = await res.json();
+          if (body && body.error) detail = `：${body.error}`;
+        } catch (e) { /* body 不是 JSON 就只顯示狀態碼 */ }
+        liveError = `HTTP ${res.status}${detail}`;
       }
     } catch (e) {
       console.warn('本機 API 無回應，改用內建快照：', e);
@@ -1700,12 +1753,20 @@ async function fetchClosePrice(statusEl, syncXlsx = false) {
     setMsg(`✅ 即時抓取成功，已填入 ${updated} 檔，資料日期 <b>${dataDate}<\/b>（${live.fetchedAt}）`
       + `<br><small>${ruleNote}　·　${live.log.join('　/　')}<\/small>${stale}${missMsg}${xlsxMsg}`);
   } else {
-    const reason = location.protocol.startsWith('http')
-      ? `本機服務已啟動，但讀取「菡萏咖啡.xlsx」時發生問題：${liveError || '沒有取得任何可用的價格資料'}。`
-      : '此頁未透過本機服務開啟，無法讀取即時資料。';
+    // 三種失敗情境的成因與處理方式都不同，訊息必須分開，否則會把使用者
+    // 導向錯誤的排查方向（例如叫已經在跑 serve.py 的人再去啟動一次）。
+    const detail = liveError || '沒有取得任何可用的價格資料';
+    let reason;
+    if (!location.protocol.startsWith('http')) {
+      reason = '此頁未透過本機服務開啟，無法取得即時資料。請改用「開啟存摺.bat」啟動後再操作。';
+    } else if (syncXlsx) {
+      reason = `連線證交所／櫃買中心抓取收盤價失敗：${detail}。這多半是對方網站回應太慢，稍後再按一次「取得盤後收盤價」通常就會成功。若持續失敗，請確認網路連線，以及「菡萏咖啡.xlsx」沒有開在 Excel 裡。`;
+    } else {
+      reason = `本機服務已啟動，但讀取「菡萏咖啡.xlsx」時發生問題：${detail}。請確認該檔案存在、且沒有開在 Excel 裡，或按「取得盤後收盤價」重新抓取。`;
+    }
     setMsg(`已填入 ${updated} 檔，使用<b>內建快照<\/b> ${dataDate} 的收盤價。`
       + `<br><small>${ruleNote}<\/small>`
-      + `<br><small style="color:var(--gain)">${reason}若要取得最新報價，請在專案資料夾執行 <code>python serve.py<\/code>，再由開啟的網頁操作；或按「取得盤後收盤價」重新抓取。<\/small>`
+      + `<br><small style="color:var(--gain)">${reason}<\/small>`
       + missMsg);
   }
 }
@@ -3707,6 +3768,9 @@ function renderAll() {
   } catch (e) {
     console.error('loadKeyIndex failed:', e);
   }
+  // 載入時先鏡像一次，這樣即使這次沒有任何編輯，「更新手機版」也拿得到
+  // 先前累積下來的手動修改。
+  scheduleStateMirror();
   const showSoldToggle = document.getElementById('showSoldToggle');
   if (showSoldToggle) {
     showSoldToggle.addEventListener('change', (e) => {

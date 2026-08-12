@@ -49,6 +49,10 @@ XLSX_NAME = "菡萏咖啡.xlsx"
 # 使用者另存的手動整理版本；Excel 存檔時會重新計算，公式快取通常是完整的，
 # 用來補上 XLSX_NAME 因為 openpyxl 寫入而清空的公式快取。純備援，不存在就略過。
 BACKUP_XLSX_NAME = "菡萏咖啡_手操版.xlsx"
+# 瀏覽器端手動編輯的鏡像檔。這些資料原本只存在 localStorage，外部程式讀不到，
+# 手機版因此看不到使用者在電腦上做的修改；頁面每次寫入 storage 就鏡像一份到
+# 這裡，讓 build_mobile.py 能把最新狀態一起打包進手機版。
+STATE_NAME = "mobile_state.json"
 # 打包成 PyInstaller exe 後 __file__ 會指向暫存解壓目錄，不是 exe 所在資料夾；
 # 這裡改用 sys.executable 找到 exe 本身的位置，讓 xlsx/html 這些資料檔仍然
 # 從「exe 旁邊」讀寫，而不是暫存目錄。一般用 python 執行時 sys.frozen 不存在，
@@ -95,15 +99,35 @@ def collect_prices() -> dict:
 
     prices = {**twse, **tpex, **esb}
     iso = fc.roc_to_iso(raw_date) or target.strftime("%Y-%m-%d")
+    target_iso = target.strftime("%Y-%m-%d")
+    tracked = sorted(set(fc.ETF_CODES) | set(fc.STOCK_CODE_MAP.values()))
+
+    # 官方每日檔要到收盤後一段時間才產出（實測 13:55 仍回前一交易日的資料），
+    # 這時「上市」和「上櫃」兩邊都是舊的，彼此一致，光靠來源互比看不出問題，
+    # 使用者剛收盤按下按鈕就只會拿到昨天的數字。因此只要已收盤卻拿到舊日期，
+    # 就直接用即時報價引擎（收盤當下即反映最後成交價）補上當日價。
+    realtime_applied = False
+    if not before_close and iso != target_iso:
+        try:
+            rt_prices, rt_date = fc.fetch_realtime_quotes(tracked)
+        except Exception:  # noqa: BLE001
+            rt_prices, rt_date = {}, ""
+        if rt_prices and fc.roc_to_iso(rt_date) == target_iso:
+            prices.update(rt_prices)
+            log.append(f"官方每日檔仍為 {iso}，已用即時報價補上 {len(rt_prices)} 檔 {target_iso} 收盤價")
+            iso = target_iso
+            realtime_applied = True
+        else:
+            log.append(f"⚠ 官方每日檔仍為 {iso}，即時報價也查無 {target_iso} 的資料")
 
     # 上市（TWSE）與上櫃／興櫃（TPEx）是各自獨立的來源，收盤後更新的時間點不一定
     # 一致；只看 TWSE 的日期會誤以為全部資料都是當日的，因此個別比對並提醒使用者。
-    if tpex and fc.roc_to_iso(tpex_date) != iso:
+    # 上面若已整批補過當日價就不必再補一次。
+    if not realtime_applied and tpex and fc.roc_to_iso(tpex_date) != iso:
         # 官方批次檔常常收盤後一兩小時才更新，改用上市櫃共用的即時報價引擎
         # （收盤當下就反映最後成交價）補上當天資料，取得不到才顯示過時警告。
-        tracked = sorted(set(fc.ETF_CODES) | set(fc.STOCK_CODE_MAP.values()))
         try:
-            rt_prices, rt_date = fc.fetch_tpex_realtime(tracked)
+            rt_prices, rt_date = fc.fetch_realtime_quotes(tracked)
         except Exception:  # noqa: BLE001
             rt_prices, rt_date = {}, ""
         if rt_prices and fc.roc_to_iso(rt_date) == iso:
@@ -1079,6 +1103,51 @@ def read_xlsx_weekly() -> dict:
     return {"ok": True, "year": year, "weekly": weekly}
 
 
+def save_browser_state(payload: dict) -> dict:
+    """把瀏覽器 localStorage 的內容鏡像存成 mobile_state.json。
+
+    頁面每次寫入 storage 後會呼叫這支 API。手機版是另一個瀏覽器、另一份
+    localStorage，看不到電腦上的編輯，這份鏡像就是 build_mobile.py 打包
+    時唯一拿得到使用者手動修改的來源。
+
+    寫檔採「先寫暫存再取代」，避免建置腳本剛好讀到寫到一半的檔案。
+    """
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "payload.data 必須是物件"}
+
+    # 空狀態不覆蓋既有鏡像。用另一個瀏覽器、無痕視窗或剛清過快取的環境開啟
+    # 頁面時，localStorage 是空的，若照寫就會把先前正確的編輯內容清掉。
+    # 真的要清空請直接刪除 mobile_state.json。
+    path_existing = BASE_DIR / STATE_NAME
+    if not data and path_existing.exists():
+        return {"ok": True, "skipped": True, "reason": "空狀態，保留既有鏡像"}
+
+    out = {
+        "savedAt": payload.get("savedAt") or datetime.now().isoformat(timespec="seconds"),
+        "count": len(data),
+        "data": data,
+    }
+    path = BASE_DIR / STATE_NAME
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+    return {"ok": True, "count": len(data), "savedAt": out["savedAt"]}
+
+
+def read_browser_state() -> dict:
+    """讀回 mobile_state.json；不存在或損毀時回傳未設定狀態，不拋錯。"""
+    path = BASE_DIR / STATE_NAME
+    if not path.exists():
+        return {"ok": False, "error": "尚未有任何鏡像資料"}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    data["ok"] = True
+    return data
+
+
 class Handler(BaseHTTPRequestHandler):
     """處理網頁與 API 請求。"""
 
@@ -1176,6 +1245,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
         path = parsed.path
+
+        if path == "/api/save-state":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                self._send_json(200, save_browser_state(body))
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                self._send_json(500, {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            return
 
         if path == "/api/write-dividend":
             try:
