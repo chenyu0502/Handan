@@ -414,6 +414,7 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
   border:1px solid var(--gold);border-radius:5px;padding:3px 6px;background:#fffdf5;
 }
 .edited-dot{color:var(--gold);font-size:9px;margin-left:5px;vertical-align:middle;}
+.stock-code{margin-left:6px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ink-soft);font-weight:500;letter-spacing:.02em;}
 .excluded-dot{color:var(--gain);font-size:11px;margin-left:5px;vertical-align:middle;}
 .btn.ghost.reset-fields{margin-left:6px;padding:5px 10px;font-size:11.5px;}
 .confirm-bar{
@@ -1658,6 +1659,15 @@ function codeForName(name) {
   return STOCK_CODE_MAP[name] || null;
 }
 
+// 表格上把股票代號跟在名稱後面顯示，對照券商軟體時比較好找。
+// ETF 的名稱本身就是代號（0056、00878…），不重複顯示；已賣出的舊部位
+// 可能不在 STOCK_CODE_MAP 內，查不到就只顯示名稱。
+function nameWithCode(name) {
+  const code = codeForName(name);
+  if (!code || code === name) return name;
+  return `${name}<span class="stock-code">${code}<\/span>`;
+}
+
 // 依使用者訂的規則決定「應該取哪一天的收盤價」：
 //   13:30 前（尚未收盤）→ 取前一個交易日
 //   13:30 後（已收盤）  → 取當日
@@ -1915,7 +1925,7 @@ function renderStockTable() {
     const excluded = effectiveCalcExcluded(acc, r);
     return `
     <tr class="${sold ? 'row-sold' : ''} ${excluded ? 'row-calc-excluded' : ''}">
-      <td>${r.name}${r.edited ? '<span class="edited-dot" title="已手動修改">●<\/span>' : ''}${excluded ? '<span class="excluded-dot" title="暫停列入計算">⊘<\/span>' : ''}<\/td>
+      <td>${nameWithCode(r.name)}${r.edited ? '<span class="edited-dot" title="已手動修改">●<\/span>' : ''}${excluded ? '<span class="excluded-dot" title="暫停列入計算">⊘<\/span>' : ''}<\/td>
       <td><span class="type-badge type-${r.type}">${TYPE_LABEL[r.type] || r.type}<\/span><\/td>
       ${editCell(r, 'qty', r.qty, null)}
       ${editCell(r, 'avg_price', r.avg_price, 2)}
@@ -2642,7 +2652,7 @@ function renderEtfTable() {
     }).join('');
 
     return `<tr>
-      <td>${r.name}<\/td>
+      <td>${nameWithCode(r.name)}<\/td>
       <td><button class="div-type-btn ${badgeCls}" data-etf="${r.name}" data-acc="${acc}">${tierInfo.label}<\/button><\/td>
       <td>${fmtInt(r.qty)}<\/td>
       <td>${r.price != null ? r.price.toFixed(2) : '—'}<\/td>
@@ -2720,7 +2730,7 @@ function renderStockDivTable() {
         <\/td>`;
       }).join('');
       return `<tr>
-        <td>${r.name}<\/td>
+        <td>${nameWithCode(r.name)}<\/td>
         <td>${fmtInt(e.qty)}<\/td>
         <td>${e.price != null ? e.price.toFixed(2) : '—'}<\/td>
         <td class="${pnlClass(e.pnl)}">${fmtMoney(e.pnl)}<\/td>
@@ -3590,7 +3600,7 @@ function renderCustomTable() {
     <tr>
       <td style="text-align:left">${ACC_LABEL[r.acc]}<span class="tag-custom">手動<\/span><\/td>
       <td style="text-align:left">${r.date}<\/td>
-      <td style="text-align:left">${r.name}<\/td>
+      <td style="text-align:left">${nameWithCode(r.name)}<\/td>
       <td class="${r.side === 'sell' ? 'down' : 'up'}">${SIDE_LABEL[r.side] || r.side}<\/td>
       <td>${r.avgCost != null ? r.avgCost.toFixed(2) : '—'}<\/td>
       <td>${fmtInt(r.qty)}<\/td>
