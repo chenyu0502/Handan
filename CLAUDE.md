@@ -134,6 +134,8 @@ Everything else (CSS, layout, all calculation logic) is passed through untouched
 
 The "取得盤後收盤價" button is inert on mobile by design; prices come from the snapshot, with `EMBEDDED_PRICES` as the fallback if the snapshot read failed at build time.
 
+**05 備份與還原's export buttons silently do nothing on the published artifact.** The viewer sandbox never grants a page download permission, so the app's `<a download>` / `XLSX.writeFile` paths are inert there — the deploy step warns about this on every publish. Handing the viewer a file would require declaring the `downloads` capability and routing the save through `window.claude.downloads.save(...)`; that has not been done, since backups are a desktop-side task. README section 7 tells the user to back up on the PC. Don't "fix" the warning by removing the buttons from the shared HTML — they work in the desktop app.
+
 `localStorage` used to be the one thing that could not cross over, since manual edits live only in the desktop browser. That is now handled: the page mirrors its whole storage to `serve.py` (`/api/save-state` → `mobile_state.json`) on every write and once on load, and the build inlines it and preloads it into the phone's `localStorage` before the app boots. Three guards make this safe — an empty payload never overwrites an existing mirror (another browser or a private window would otherwise wipe it), the mobile build sets `window.__HANDAN_MOBILE__` so it never mirrors back, and the preload is keyed on `savedAt` so a given snapshot overwrites the phone only once.
 
 Two field-tested facts worth not rediscovering:
