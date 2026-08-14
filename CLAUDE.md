@@ -143,6 +143,22 @@ Two field-tested facts worth not rediscovering:
 - **Opening the raw HTML from iOS's Files app does not work.** The Quick Look preview renders static markup but does not run the app's JavaScript, so the page shows no data and the tabs don't switch. This is what motivated the Artifact route; the file itself is fine and works when double-clicked on Windows.
 - **iOS Universal Links hijack `claude.ai` links** into the Claude app, which has no artifact browser, so tapping the URL dead-ends. Pasting the URL into Safari's address bar bypasses the interception; the user then does "加入主畫面" once and opens it from the home-screen icon thereafter. Because of that saved icon, always republish to the **same artifact URL**.
 
+### Cloud (Vercel + Firestore) build
+
+This is the primary phone path and the one the user actually uses day to day. Unlike the Artifact build it needs no human in the loop: `serve.py` pushes a snapshot to Firestore on every write, and the deployed page pulls it after login.
+
+- **Live at `https://handan-web.vercel.app`** (Vercel project `handan-web`), built by `build_web.py` into `handan-web/`, which is gitignored. Deploy with `vercel deploy --prod --yes` from that directory.
+- **Firebase project `myfirebase-22090`, shared with the user's separate `Claude_台股分析` project.** Firestore rules live in that repo's `firestore.rules`; the `handan/{docId}` block there grants read only to the owner's uid and denies all client writes. Writes come from `serve.py` via a service account, which bypasses rules entirely. If those rules are ever re-published from that file, the handan block must survive or the phone stops loading.
+- **`firebase-service-account.json` sits in `HanDan/` and is gitignored.** Without it `serve.py` prints one line and disables cloud sync; everything else keeps working, so its absence is never fatal.
+- **Push is triggered centrally in `Handler._send_json`**: any 200 from a POST, plus the one GET that writes (`updateXlsx=1`). New write endpoints need no extra wiring. Pushes are debounced by `CLOUD_PUSH_DELAY_SEC` since the page mirrors storage on every keystroke-level write.
+
+**The security constraint that shaped this build**: a Vercel URL is world-readable, and Vercel's password protection is a paid feature. The login gate only guards Firestore, so anything left in the HTML is public to anyone who views source. Three blocks therefore must never ship in `handan-web/index.html` — `PORTFOLIO_DATA` (~110 KB, the full ledger since 2021), `STOCK_CODE_MAP` (every holding's name), and `EMBEDDED_PRICES` (every holding's code). `build_web.py` strips all three and aborts if any one of them fails to match, rather than deploying a half-sanitised page. They are re-injected into memory after login from the snapshot's `portfolio` and `codes` keys. **Any new constant carrying holdings data must be added to that strip list.** `STOCK_CODE_MAP` is parsed from the HTML rather than reused from `fetch_close.py` because the two legitimately differ — the HTML has an extra 凱基金 alias for 2883.
+
+Two structural details that are easy to break:
+
+- **The app script must not self-start.** `build_web.py` retags it `type="text/handan-app"` so the browser keeps it as inert text; the boot script injects it only after login, after `PORTFOLIO_DATA` and the code map are in place and `localStorage` is preloaded. Starting it earlier means it reads empty state.
+- **Closing-tag replacements must run from the end of the file.** The inlined SheetJS contains an HTML export template whose string literals include `</head><body>` and `</body></html>`, and they appear *before* the real tags. `must_replace_last()` exists for exactly this; a forward search silently injects into a JavaScript string and breaks the whole page.
+
 ### Working with this codebase
 
 - All UI strings, comments, and docstrings are in Traditional Chinese (Taiwan usage) — match that when editing this project.

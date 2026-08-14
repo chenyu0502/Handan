@@ -22,3 +22,12 @@ HanDan/*.bak
 # 瀏覽器編輯內容的鏡像，含個人財務資料，由 serve.py 自動寫入
 HanDan/mobile_state.json
 HanDan/mobile_state.json.tmp
+
+# Firebase 服務帳戶金鑰。等同資料庫的完整存取權，絕不可提交
+HanDan/firebase-service-account.json
+**/*service-account*.json
+**/serviceAccountKey.json
+
+# 雲端版建置產物與 Vercel 專案連結（由 build_web.py 重新產生）
+HanDan/handan-web/
+**/.vercel

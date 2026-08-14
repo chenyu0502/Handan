@@ -53,6 +53,14 @@ BACKUP_XLSX_NAME = "菡萏咖啡_手操版.xlsx"
 # 手機版因此看不到使用者在電腦上做的修改；頁面每次寫入 storage 就鏡像一份到
 # 這裡，讓 build_mobile.py 能把最新狀態一起打包進手機版。
 STATE_NAME = "mobile_state.json"
+# Firebase 服務帳戶金鑰。放著就會自動把快照推上 Firestore 供手機讀取；
+# 檔案不存在時整個雲端同步靜默停用，其餘功能完全不受影響。
+# 這把金鑰等同資料庫的完整存取權，已列入 .gitignore，不可提交或外流。
+SERVICE_ACCOUNT_NAME = "firebase-service-account.json"
+FIRESTORE_DOC = "handan/snapshot"
+# 網頁每次寫入 storage 都會鏡像一次，逐次上傳沒有意義；短時間內的多次
+# 異動合併成一次推送，減少 Firestore 寫入次數。
+CLOUD_PUSH_DELAY_SEC = 3.0
 # 打包成 PyInstaller exe 後 __file__ 會指向暫存解壓目錄，不是 exe 所在資料夾；
 # 這裡改用 sys.executable 找到 exe 本身的位置，讓 xlsx/html 這些資料檔仍然
 # 從「exe 旁邊」讀寫，而不是暫存目錄。一般用 python 執行時 sys.frozen 不存在，
@@ -1148,6 +1156,154 @@ def read_browser_state() -> dict:
     return data
 
 
+def read_portfolio_data() -> dict:
+    """從主檔 HTML 取出 PORTFOLIO_DATA 這份歷史損益基準資料。
+
+    Artifact 版是私人頁面，可以直接把這份資料內嵌在檔案裡；但部署到 Vercel
+    的雲端版網址是公開的，內嵌等於讓任何人不必登入、看網頁原始碼就能取得
+    2021 年至今的完整帳本。因此雲端版的 HTML 不含這段，改由這裡讀出來連同
+    快照一起推上 Firestore，登入後才下載。
+    """
+    html_path = BASE_DIR / HTML_NAME
+    if not html_path.exists():
+        return {"ok": False, "error": f"找不到 {HTML_NAME}"}
+
+    text = html_path.read_text(encoding="utf-8")
+    match = re.search(r"const PORTFOLIO_DATA = (\{.*?\});", text, re.S)
+    if not match:
+        return {"ok": False, "error": "HTML 中找不到 PORTFOLIO_DATA 區塊"}
+
+    try:
+        return {"ok": True, "data": json.loads(match.group(1))}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def read_stock_code_map() -> dict:
+    """從主檔 HTML 取出個股名稱對照表。
+
+    這份表列出所有持股名稱與代號，等於把投資組合攤開來，因此雲端版同樣
+    不內嵌，改由登入後注入。刻意解析 HTML 裡那一份、而不是直接用
+    fetch_close.STOCK_CODE_MAP，因為兩邊允許有差異（例如同一代號的舊稱與
+    新稱並存），這裡要的是畫面實際使用的那一份。
+    """
+    html_path = BASE_DIR / HTML_NAME
+    if not html_path.exists():
+        return {"ok": False, "error": f"找不到 {HTML_NAME}"}
+
+    text = html_path.read_text(encoding="utf-8")
+    match = re.search(r"const STOCK_CODE_MAP = (\{.*?\n\});", text, re.S)
+    if not match:
+        return {"ok": False, "error": "HTML 中找不到 STOCK_CODE_MAP 區塊"}
+
+    try:
+        # JS 的物件字面量在這裡剛好也是合法的 Python 字面量（單引號、
+        # 允許尾隨逗號），用 literal_eval 解析比自己寫剖析器安全。
+        return {"ok": True, "data": ast.literal_eval(match.group(1))}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def build_snapshot() -> dict:
+    """彙整手機端需要的全部唯讀資料。
+
+    任一項讀取失敗都不中斷：該項標記 ok=False，手機端會自行退回可用的
+    替代來源，行為與讀不到資料時一致。
+    """
+    snapshot: dict[str, dict] = {}
+    for key, fn in (("prices", read_xlsx_prices),
+                    ("balance", read_xlsx_balance),
+                    ("weekly", read_xlsx_weekly)):
+        try:
+            snapshot[key] = fn()
+        except Exception as exc:  # noqa: BLE001
+            snapshot[key] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    snapshot["state"] = read_browser_state()
+    snapshot["portfolio"] = read_portfolio_data()
+    snapshot["codes"] = read_stock_code_map()
+    return snapshot
+
+
+_cloud_session = None
+_cloud_project = ""
+_cloud_ready: bool | None = None  # None 表示尚未嘗試初始化
+_cloud_timer: threading.Timer | None = None
+_cloud_lock = threading.Lock()
+
+
+def _init_cloud() -> bool:
+    """準備 Firestore 連線。金鑰不存在或套件未安裝時回傳 False 並停用同步。"""
+    global _cloud_session, _cloud_project, _cloud_ready
+    if _cloud_ready is not None:
+        return _cloud_ready
+
+    key_path = BASE_DIR / SERVICE_ACCOUNT_NAME
+    if not key_path.exists():
+        print(f"[雲端同步] 未找到 {SERVICE_ACCOUNT_NAME}，略過雲端同步（其餘功能不受影響）")
+        _cloud_ready = False
+        return False
+
+    try:
+        from google.auth.transport.requests import AuthorizedSession
+        from google.oauth2 import service_account
+
+        info = json.loads(key_path.read_text(encoding="utf-8"))
+        _cloud_project = info["project_id"]
+        cred = service_account.Credentials.from_service_account_file(
+            str(key_path), scopes=["https://www.googleapis.com/auth/datastore"])
+        _cloud_session = AuthorizedSession(cred)
+        print(f"[雲端同步] 已啟用，專案 {_cloud_project}")
+        _cloud_ready = True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[雲端同步] 初始化失敗（{type(exc).__name__}: {exc}），略過雲端同步")
+        _cloud_ready = False
+    return _cloud_ready
+
+
+def push_snapshot_to_cloud() -> dict:
+    """把最新快照寫進 Firestore，供手機端讀取。
+
+    整包快照序列化成單一字串欄位，而不是展開成 Firestore 的巢狀型別。
+    這樣不必為每個欄位做型別包裝，前端拿到後 JSON.parse 即可，兩邊的
+    資料結構也自然與本機 API 回傳的完全一致。
+    """
+    if not _init_cloud():
+        return {"ok": False, "error": "雲端同步未啟用"}
+
+    payload = json.dumps(build_snapshot(), ensure_ascii=False)
+    url = (f"https://firestore.googleapis.com/v1/projects/{_cloud_project}"
+           f"/databases/(default)/documents/{FIRESTORE_DOC}")
+    body = {"fields": {
+        "payload": {"stringValue": payload},
+        "updatedAt": {"stringValue": datetime.now().isoformat(timespec="seconds")},
+    }}
+    try:
+        r = _cloud_session.patch(url, json=body, timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[雲端同步] 推送失敗（{type(exc).__name__}: {exc}）")
+        return {"ok": False, "error": str(exc)}
+
+    if r.status_code != 200:
+        print(f"[雲端同步] 推送失敗 HTTP {r.status_code}：{r.text[:200]}")
+        return {"ok": False, "error": f"HTTP {r.status_code}"}
+
+    print(f"[雲端同步] 已更新（{len(payload):,} bytes）")
+    return {"ok": True, "bytes": len(payload)}
+
+
+def schedule_cloud_push(delay: float = CLOUD_PUSH_DELAY_SEC) -> None:
+    """延遲推送，短時間內的多次呼叫只會實際送出最後一次。"""
+    global _cloud_timer
+    if _cloud_ready is False:
+        return
+    with _cloud_lock:
+        if _cloud_timer is not None:
+            _cloud_timer.cancel()
+        _cloud_timer = threading.Timer(delay, push_snapshot_to_cloud)
+        _cloud_timer.daemon = True
+        _cloud_timer.start()
+
+
 class Handler(BaseHTTPRequestHandler):
     """處理網頁與 API 請求。"""
 
@@ -1162,6 +1318,11 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, payload: dict) -> None:
         self._send(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8")
+        # 資料有異動就排程一次雲端同步。所有寫入類端點都是 POST，唯一的例外
+        # 是帶 updateXlsx=1 的取價（GET），因此一併納入。集中在這裡判斷，
+        # 日後新增寫入端點不必記得補上推送。
+        if status == 200 and (self.command == "POST" or "updateXlsx=1" in self.path):
+            schedule_cloud_push()
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
