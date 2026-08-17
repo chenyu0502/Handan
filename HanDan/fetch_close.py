@@ -269,8 +269,8 @@ def fetch_tpex() -> tuple[dict[str, float], str]:
     return _parse_quotes(rows), _extract_date(rows)
 
 
-def fetch_realtime_quotes(codes: list[str]) -> tuple[dict[str, float], str]:
-    """用上市櫃共用的即時報價引擎取得當日最後成交價。
+def fetch_realtime_quotes(codes: list[str]) -> tuple[dict[str, float], dict[str, float], str]:
+    """用上市櫃共用的即時報價引擎取得當日最後成交價與前一交易日收盤價。
 
     官方每日批次檔要到收盤後一段時間才產出（實測 13:55 仍是前一交易日的
     資料），剛收盤就抓價會拿到昨天的數字；這個引擎在收盤當下就已反映最後
@@ -281,13 +281,19 @@ def fetch_realtime_quotes(codes: list[str]) -> tuple[dict[str, float], str]:
     因此呼叫端不需要先分辨商品屬於上市還是上櫃，把整份追蹤清單丟進來即可。
 
     單次查詢的檔數有上限，超過會整批查不到，所以分批送出。
-    回傳 (價格, 資料日期)。
+
+    同時取回前一交易日收盤價（欄位 y），這是「今日損益」唯一的來源：官方
+    每日檔只有當天的四價，沒有前一日收盤，而 xlsx 的現價欄位也只存一個
+    數字，都算不出今天漲跌了多少。
+
+    回傳 (當日價, 前一日收盤價, 資料日期)。
     """
     if not codes:
-        return {}, ""
+        return {}, {}, ""
 
     targets = [f"{market}_{c}.tw" for c in codes for market in ("tse", "otc")]
     prices: dict[str, float] = {}
+    prev_closes: dict[str, float] = {}
     date = ""
 
     for i in range(0, len(targets), MIS_BATCH_SIZE):
@@ -311,11 +317,22 @@ def fetch_realtime_quotes(codes: list[str]) -> tuple[dict[str, float], str]:
                 value = float(z)
             except ValueError:
                 continue
-            if value > 0:
-                prices[code] = value
-                date = date or (row.get("d") or "")
+            if value <= 0:
+                continue
 
-    return prices, date
+            prices[code] = value
+            date = date or (row.get("d") or "")
+
+            # y 是前一交易日收盤價。無成交的商品這欄可能是 "-" 或 0，
+            # 直接跳過，讓呼叫端把該檔視為算不出今日漲跌。
+            try:
+                prev = float(row.get("y"))
+                if prev > 0:
+                    prev_closes[code] = prev
+            except (TypeError, ValueError):
+                pass
+
+    return prices, prev_closes, date
 
 
 # --- 輸出 ---------------------------------------------------------------
@@ -485,7 +502,7 @@ def main() -> int:
     realtime_applied = False
     if not before_close and iso_date != target_iso:
         try:
-            rt_prices, rt_date = fetch_realtime_quotes(tracked)
+            rt_prices, _rt_prev, rt_date = fetch_realtime_quotes(tracked)
         except Exception as exc:  # noqa: BLE001
             rt_prices, rt_date = {}, ""
             print(f"[警告] 即時報價備援抓取失敗（{type(exc).__name__}: {exc}）")
@@ -506,7 +523,7 @@ def main() -> int:
     # 上面若已整批補過當日價就不必再補一次。
     if not realtime_applied and tpex and roc_to_iso(tpex_date) != iso_date:
         try:
-            rt_prices, rt_date = fetch_realtime_quotes(tracked)
+            rt_prices, _rt_prev, rt_date = fetch_realtime_quotes(tracked)
         except Exception as exc:  # noqa: BLE001
             rt_prices, rt_date = {}, ""
             print(f"[警告] 即時報價備援抓取失敗（{type(exc).__name__}: {exc}）")

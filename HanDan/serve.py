@@ -56,6 +56,10 @@ STATE_NAME = "mobile_state.json"
 # Firebase 服務帳戶金鑰。放著就會自動把快照推上 Firestore 供手機讀取；
 # 檔案不存在時整個雲端同步靜默停用，其餘功能完全不受影響。
 # 這把金鑰等同資料庫的完整存取權，已列入 .gitignore，不可提交或外流。
+# 前一交易日收盤價的落地檔。只有即時報價引擎給得出這個數字，而開啟頁面走的
+# 是 xlsx（現價欄位只存一個值），因此抓價時存一份下來，下次開頁面才有基準
+# 可以算「今日損益」。內容只有公開的市場報價，不含持股數量或成本。
+PREV_CLOSE_NAME = "prev_closes.json"
 SERVICE_ACCOUNT_NAME = "firebase-service-account.json"
 FIRESTORE_DOC = "handan/snapshot"
 # 網頁每次寫入 storage 都會鏡像一次，逐次上傳沒有意義；短時間內的多次
@@ -69,16 +73,22 @@ BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False
     else Path(__file__).resolve().parent
 
 
-def _finalize_prices(prices: dict, iso: str, target_iso: str,
-                     before_close: bool, log: list[str]) -> dict:
-    """把抓到的價格篩成追蹤清單，組成網頁需要的回傳格式。"""
+def _finalize_prices(prices: dict, iso: str, target_iso: str, before_close: bool,
+                     log: list[str], prev_closes: dict | None = None) -> dict:
+    """把抓到的價格篩成追蹤清單，組成網頁需要的回傳格式。
+
+    prev_closes 是前一交易日收盤價，只有即時報價引擎提供得出來，用於前端
+    計算「今日損益」。走官方每日檔的路徑時會是空的，前端該卡片顯示為無資料。
+    """
     wanted = set(fc.ETF_CODES) | set(fc.STOCK_CODE_MAP.values())
+    prev = prev_closes or {}
     return {
         "ok": True,
         "date": iso,
         "targetDate": target_iso,
         "beforeClose": before_close,
         "prices": {c: prices[c] for c in wanted if c in prices},
+        "prevCloses": {c: prev[c] for c in wanted if c in prev},
         "missing": sorted(wanted - prices.keys()),
         "unresolved": fc.UNRESOLVED,
         "log": log,
@@ -104,12 +114,14 @@ def collect_prices() -> dict:
 
     # --- 快路徑：已收盤時先問即時報價引擎 ---------------------------------
     realtime: dict[str, float] = {}
+    prev_closes: dict[str, float] = {}
     if not before_close:
         try:
-            rt_prices, rt_date = fc.fetch_realtime_quotes(tracked)
+            rt_prices, rt_prev, rt_date = fc.fetch_realtime_quotes(tracked)
             rt_iso = fc.roc_to_iso(rt_date)
             if rt_prices and rt_iso == target_iso:
                 realtime = rt_prices
+                prev_closes = rt_prev
                 log.append(f"即時報價：{len(realtime)} 檔 {target_iso} 收盤價")
             elif rt_prices:
                 log.append(f"即時報價回傳 {rt_iso}，非目標日，改抓官方每日檔")
@@ -133,7 +145,7 @@ def collect_prices() -> dict:
         prices = {**esb, **realtime}  # 同一代號以即時報價為準
         if esb and fc.roc_to_iso(esb_date) != target_iso:
             log.append(f"⚠ 興櫃資料為 {fc.roc_to_iso(esb_date)} 收盤價，尚未更新至 {target_iso}")
-        return _finalize_prices(prices, target_iso, target_iso, before_close, log)
+        return _finalize_prices(prices, target_iso, target_iso, before_close, log, prev_closes)
 
     # --- 完整路徑：尚未收盤，或即時報價不可用 -----------------------------
     # 先試指定日期，失敗則退回最新一期。
@@ -177,11 +189,12 @@ def collect_prices() -> dict:
     realtime_applied = False
     if not before_close and iso != target_iso:
         try:
-            rt_prices, rt_date = fc.fetch_realtime_quotes(tracked)
+            rt_prices, rt_prev, rt_date = fc.fetch_realtime_quotes(tracked)
         except Exception:  # noqa: BLE001
-            rt_prices, rt_date = {}, ""
+            rt_prices, rt_prev, rt_date = {}, {}, ""
         if rt_prices and fc.roc_to_iso(rt_date) == target_iso:
             prices.update(rt_prices)
+            prev_closes = rt_prev
             log.append(f"官方每日檔仍為 {iso}，已用即時報價補上 {len(rt_prices)} 檔 {target_iso} 收盤價")
             iso = target_iso
             realtime_applied = True
@@ -195,11 +208,12 @@ def collect_prices() -> dict:
         # 官方批次檔常常收盤後一兩小時才更新，改用上市櫃共用的即時報價引擎
         # （收盤當下就反映最後成交價）補上當天資料，取得不到才顯示過時警告。
         try:
-            rt_prices, rt_date = fc.fetch_realtime_quotes(tracked)
+            rt_prices, rt_prev, rt_date = fc.fetch_realtime_quotes(tracked)
         except Exception:  # noqa: BLE001
-            rt_prices, rt_date = {}, ""
+            rt_prices, rt_prev, rt_date = {}, {}, ""
         if rt_prices and fc.roc_to_iso(rt_date) == iso:
             prices.update(rt_prices)
+            prev_closes = rt_prev
             tpex.update(rt_prices)
             log.append(f"上櫃官方批次檔為 {fc.roc_to_iso(tpex_date)}，已改用即時報價補上 {len(rt_prices)} 檔")
         else:
@@ -208,7 +222,7 @@ def collect_prices() -> dict:
     if esb and fc.roc_to_iso(esb_date) != iso:
         log.append(f"⚠ 興櫃資料為 {fc.roc_to_iso(esb_date)} 收盤價，尚未更新至 {iso}")
 
-    return _finalize_prices(prices, iso, target_iso, before_close, log)
+    return _finalize_prices(prices, iso, target_iso, before_close, log, prev_closes)
 
 
 def update_xlsx_prices(prices: dict) -> dict:
@@ -1203,6 +1217,33 @@ def read_browser_state() -> dict:
     return data
 
 
+def save_prev_closes(price_date: str, prev_closes: dict) -> None:
+    """把前一交易日收盤價落地，供之後開啟頁面時計算今日損益。
+
+    一併記下這批價格的交易日（price_date），前端才能判斷基準是否還適用：
+    隔天若沒重新抓價，這份資料就過期了，卡片上會顯示舊的基準日提醒使用者。
+    空的就不寫，避免把可用的舊基準蓋掉。
+    """
+    if not prev_closes:
+        return
+    path = BASE_DIR / PREV_CLOSE_NAME
+    tmp = path.with_suffix(".json.tmp")
+    payload = {"ok": True, "priceDate": price_date, "prevCloses": prev_closes}
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_prev_closes() -> dict:
+    """讀回落地的前一交易日收盤價；不存在或損毀時回傳未設定狀態，不拋錯。"""
+    path = BASE_DIR / PREV_CLOSE_NAME
+    if not path.exists():
+        return {"ok": False, "error": "尚未有前一交易日收盤價，請按一次「取得盤後收盤價」"}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def read_portfolio_data() -> dict:
     """從主檔 HTML 取出 PORTFOLIO_DATA 這份歷史損益基準資料。
 
@@ -1379,6 +1420,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/close-prices":
             try:
                 result = collect_prices()
+                # 前一交易日收盤價只有這條路徑取得到，落地一份供之後開啟頁面
+                # 計算今日損益（那時走的是 xlsx，只有現價可讀）。
+                save_prev_closes(result.get("date", ""), result.get("prevCloses") or {})
                 # 只有網頁上手動按「取得盤後收盤價」才會帶這個參數；開啟網頁時
                 # 自動抓價的那一次不寫入 xlsx，避免每次開網頁都動到 Excel 檔案。
                 if query.get("updateXlsx", ["0"])[0] == "1":
@@ -1394,7 +1438,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/xlsx-prices":
             try:
-                self._send_json(200, read_xlsx_prices())
+                data = read_xlsx_prices()
+                # xlsx 只存現價，今日損益需要的基準另外從落地檔補上
+                stored = read_prev_closes()
+                if stored.get("ok"):
+                    data["prevCloses"] = stored.get("prevCloses") or {}
+                    data["prevCloseDate"] = stored.get("priceDate") or ""
+                self._send_json(200, data)
             except Exception as exc:  # noqa: BLE001
                 traceback.print_exc()
                 self._send_json(500, {

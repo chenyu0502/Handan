@@ -23,6 +23,10 @@ HanDan/*.bak
 HanDan/mobile_state.json
 HanDan/mobile_state.json.tmp
 
+# 前一交易日收盤價快取（今日損益的比較基準），抓價時自動重新產生
+HanDan/prev_closes.json
+HanDan/prev_closes.json.tmp
+
 # Firebase 服務帳戶金鑰。等同資料庫的完整存取權，絕不可提交
 HanDan/firebase-service-account.json
 **/*service-account*.json

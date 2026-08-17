@@ -237,6 +237,10 @@ select.yr-select{
 @media(max-width:500px){.grid-4{grid-template-columns:1fr;}}
 .grid-2{grid-template-columns:repeat(2,1fr);}
 @media(max-width:500px){.grid-2{grid-template-columns:1fr;}}
+/* 單年週績效的三張卡片（今日／當週／當年損益）。桌面版要求最小寬度才不會
+   被年度選單擠成細長條；手機版必須解除，否則 520px 會撐出水平捲軸。 */
+.weekly-metric-row{flex:1;min-width:520px;}
+@media(max-width:720px){.weekly-metric-row{min-width:0;}}
 .metric-card{
   background:#fff;
   border:1px solid var(--paper-line);
@@ -467,7 +471,7 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
         </div>
         <div class="control-row">
           <select class="yr-select" id="weeklyYearSelect" style="align-self:flex-start;"></select>
-          <div class="grid grid-2" id="weeklyCurrentMetric" style="flex:1;min-width:360px;"></div>
+          <div class="grid grid-3 weekly-metric-row" id="weeklyCurrentMetric"></div>
         </div>
         <div class="chart-box"><canvas id="weeklyChart"></canvas></div>
 
@@ -772,6 +776,10 @@ function showStorageModeNotice() {
 const state = {
   account: 'main',
   weeklyYear: null,
+  // 前一交易日收盤價與其對應的交易日，由 serve.py 隨價格一起回傳。
+  // 只有即時報價引擎給得出這個數字，用來算「今日損益」；取不到時卡片顯示為無資料。
+  prevCloses: null,
+  prevCloseDate: '',
   customWeekly: { main: {}, keqiang: {} }, // {account: {year: [entries]}}
   customTransactions: { main: {}, keqiang: {} }, // {account: {year: [{date,name,side,avgCost,qty,amount}]}}，04 記一筆的買賣交易明細
   soldOverride: { main: {}, keqiang: {} }, // {account: {stockId: true/false}}
@@ -1062,6 +1070,31 @@ function currentHoldingsValue(acc) {
   const held = baseStocks(acc).map(r => effectiveStock(acc, r))
     .filter(r => !effectiveSold(acc, r) && !effectiveCalcExcluded(acc, r));
   return held.reduce((s, r) => s + (r.value || 0), 0);
+}
+
+// 今日損益：以目前持股股數計算的當日行情變化，即 Σ (現價 − 前一交易日收盤) × 股數。
+// 這是券商軟體慣用的定義，只反映價格波動，不含當日買賣造成的成本變化。
+// 前一交易日收盤價只有即時報價引擎提供，取不到就回傳 null 讓卡片顯示無資料，
+// 不用 0 代替（0 會被誤讀成「今天沒漲跌」）。
+// 回傳 { pnl, base, counted, total }：base 為市值基準，用來換算變動百分比。
+function todayHoldingsPnl(acc) {
+  const prev = state.prevCloses;
+  if (!prev) return null;
+
+  let pnl = 0, base = 0, counted = 0, total = 0;
+  baseStocks(acc).forEach(r => {
+    if (effectiveSold(acc, r) || effectiveCalcExcluded(acc, r)) return;
+    total++;
+    const e = effectiveStock(acc, r);
+    const code = codeForName(r.name);
+    const prevClose = code ? prev[code] : null;
+    if (prevClose == null || e.price == null || e.qty == null) return;
+    pnl += (e.price - prevClose) * e.qty;
+    base += prevClose * e.qty;
+    counted++;
+  });
+
+  return counted ? { pnl, base, counted, total } : null;
 }
 
 // 讀「菡萏咖啡.xlsx」當年損益表 A4:I55 的每週記帳（含週績效），取代原本
@@ -1386,7 +1419,29 @@ function renderYearlyMetrics() {
   };
 
   const weeklyMetricEl = document.getElementById('weeklyCurrentMetric');
-  if (weeklyMetricEl) weeklyMetricEl.innerHTML = cardHtml(weekCard) + cardHtml(currentCard);
+  // 今日損益。只在選到最新年度時有意義：其他年度是已結束的歷史資料，
+  // 拿今天的行情去比對沒有意義，一律顯示為無資料。
+  const today = isLatestWeekly ? todayHoldingsPnl(state.account) : null;
+  let todaySub;
+  if (!isLatestWeekly) {
+    todaySub = '僅適用於最新年度';
+  } else if (!today) {
+    todaySub = '需按一次「取得盤後收盤價」取得比較基準';
+  } else {
+    const pct = today.base ? (today.pnl / today.base) : null;
+    const partial = today.counted < today.total ? `　·　${today.total - today.counted} 檔無報價` : '';
+    todaySub = `較前一交易日收盤${pct != null ? `　${fmtPct(pct)}` : ''}${partial}`;
+  }
+  const todayCard = {
+    label: '今日損益',
+    value: today ? fmtMoney(today.pnl) : '—',
+    sub: todaySub,
+    cls: today ? pnlClass(today.pnl) : '',
+  };
+
+  if (weeklyMetricEl) {
+    weeklyMetricEl.innerHTML = cardHtml(todayCard) + cardHtml(weekCard) + cardHtml(currentCard);
+  }
 
   const cards = [
     { label: `${latest ? latest.year : '—'} 年庫存市值`, value: fmtMoney(latest ? latest.settlement : null), sub: prev ? `較 ${prev.year} 年　${fmtMoney((latest.settlement||0)-(prev.settlement||0))}` : '', cls: '' },
@@ -1705,6 +1760,12 @@ async function fetchClosePrice(statusEl, syncXlsx = false) {
         const data = await res.json();
         if (data && data.ok && data.prices && Object.keys(data.prices).length) {
           live = data;
+          // 記下今日損益要用的比較基準。抓價那條路徑回傳的 date 就是這批價格
+          // 的交易日；讀 xlsx 那條路徑則另外附上落地檔記錄的日期。
+          if (data.prevCloses && Object.keys(data.prevCloses).length) {
+            state.prevCloses = data.prevCloses;
+            state.prevCloseDate = data.prevCloseDate || data.date || '';
+          }
         } else if (data && !data.ok) {
           liveError = data.error || '未知錯誤';
         }
