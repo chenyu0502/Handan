@@ -69,11 +69,73 @@ BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False
     else Path(__file__).resolve().parent
 
 
+def _finalize_prices(prices: dict, iso: str, target_iso: str,
+                     before_close: bool, log: list[str]) -> dict:
+    """把抓到的價格篩成追蹤清單，組成網頁需要的回傳格式。"""
+    wanted = set(fc.ETF_CODES) | set(fc.STOCK_CODE_MAP.values())
+    return {
+        "ok": True,
+        "date": iso,
+        "targetDate": target_iso,
+        "beforeClose": before_close,
+        "prices": {c: prices[c] for c in wanted if c in prices},
+        "missing": sorted(wanted - prices.keys()),
+        "unresolved": fc.UNRESOLVED,
+        "log": log,
+        "fetchedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 def collect_prices() -> dict:
-    """抓取收盤價並整理為網頁可直接使用的格式。"""
+    """抓取收盤價並整理為網頁可直接使用的格式。
+
+    已收盤時走「即時報價優先」的快路徑：該引擎只查追蹤清單、通常一秒內
+    回應，收盤後給的就是當日收盤價。官方每日檔要收盤後約一小時才產出，
+    在那之前抓回來的是前一交易日的資料，實測光上市的全量備援檔就要 45 秒
+    （指定日期端點若再連線失敗，重試會把等待拉到數分鐘），而抓回來的內容
+    幾乎整批會被即時報價覆蓋掉，並不划算。
+
+    只有在尚未收盤、或即時報價不可用時，才走官方每日檔的完整路徑。
+    """
     target, before_close = fc.target_trading_date()
+    target_iso = target.strftime("%Y-%m-%d")
+    tracked = sorted(set(fc.ETF_CODES) | set(fc.STOCK_CODE_MAP.values()))
     log: list[str] = []
 
+    # --- 快路徑：已收盤時先問即時報價引擎 ---------------------------------
+    realtime: dict[str, float] = {}
+    if not before_close:
+        try:
+            rt_prices, rt_date = fc.fetch_realtime_quotes(tracked)
+            rt_iso = fc.roc_to_iso(rt_date)
+            if rt_prices and rt_iso == target_iso:
+                realtime = rt_prices
+                log.append(f"即時報價：{len(realtime)} 檔 {target_iso} 收盤價")
+            elif rt_prices:
+                log.append(f"即時報價回傳 {rt_iso}，非目標日，改抓官方每日檔")
+            else:
+                log.append("即時報價查無資料，改抓官方每日檔")
+        except Exception as exc:  # noqa: BLE001
+            log.append(f"即時報價失敗（{type(exc).__name__}），改抓官方每日檔")
+
+    if realtime:
+        # 即時報價涵蓋上市與上櫃，補不到的只剩興櫃（該引擎不提供興櫃報價，
+        # tse/otc/emg/rot 四種前綴皆實測無成交價）。因此只補這一組資料集，
+        # 跳過最慢的上市／上櫃官方全量檔。
+        esb: dict[str, float] = {}
+        esb_date = ""
+        try:
+            esb, _esb_src, esb_date = fc.fetch_tpex_esb()
+            log.append(f"興櫃：{len(esb)} 檔" if esb else "興櫃：所有候選端點皆無回應")
+        except Exception as exc:  # noqa: BLE001
+            log.append(f"興櫃抓取失敗（{type(exc).__name__}）")
+
+        prices = {**esb, **realtime}  # 同一代號以即時報價為準
+        if esb and fc.roc_to_iso(esb_date) != target_iso:
+            log.append(f"⚠ 興櫃資料為 {fc.roc_to_iso(esb_date)} 收盤價，尚未更新至 {target_iso}")
+        return _finalize_prices(prices, target_iso, target_iso, before_close, log)
+
+    # --- 完整路徑：尚未收盤，或即時報價不可用 -----------------------------
     # 先試指定日期，失敗則退回最新一期。
     twse: dict[str, float] = {}
     raw_date = ""
@@ -106,9 +168,7 @@ def collect_prices() -> dict:
         log.append(f"興櫃抓取失敗（{type(exc).__name__}）")
 
     prices = {**twse, **tpex, **esb}
-    iso = fc.roc_to_iso(raw_date) or target.strftime("%Y-%m-%d")
-    target_iso = target.strftime("%Y-%m-%d")
-    tracked = sorted(set(fc.ETF_CODES) | set(fc.STOCK_CODE_MAP.values()))
+    iso = fc.roc_to_iso(raw_date) or target_iso
 
     # 官方每日檔要到收盤後一段時間才產出（實測 13:55 仍回前一交易日的資料），
     # 這時「上市」和「上櫃」兩邊都是舊的，彼此一致，光靠來源互比看不出問題，
@@ -148,20 +208,7 @@ def collect_prices() -> dict:
     if esb and fc.roc_to_iso(esb_date) != iso:
         log.append(f"⚠ 興櫃資料為 {fc.roc_to_iso(esb_date)} 收盤價，尚未更新至 {iso}")
 
-    wanted = set(fc.ETF_CODES) | set(fc.STOCK_CODE_MAP.values())
-    hit = {c: prices[c] for c in wanted if c in prices}
-
-    return {
-        "ok": True,
-        "date": iso,
-        "targetDate": target.strftime("%Y-%m-%d"),
-        "beforeClose": before_close,
-        "prices": hit,
-        "missing": sorted(wanted - prices.keys()),
-        "unresolved": fc.UNRESOLVED,
-        "log": log,
-        "fetchedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
+    return _finalize_prices(prices, iso, target_iso, before_close, log)
 
 
 def update_xlsx_prices(prices: dict) -> dict:
