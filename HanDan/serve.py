@@ -51,7 +51,7 @@ XLSX_NAME = "菡萏咖啡.xlsx"
 BACKUP_XLSX_NAME = "菡萏咖啡_手操版.xlsx"
 # 瀏覽器端手動編輯的鏡像檔。這些資料原本只存在 localStorage，外部程式讀不到，
 # 手機版因此看不到使用者在電腦上做的修改；頁面每次寫入 storage 就鏡像一份到
-# 這裡，讓 build_mobile.py 能把最新狀態一起打包進手機版。
+# 這裡，讓 build_web.py／雲端快照能把最新狀態一起帶到手機。
 STATE_NAME = "mobile_state.json"
 # Firebase 服務帳戶金鑰。放著就會自動把快照推上 Firestore 供手機讀取；
 # 檔案不存在時整個雲端同步靜默停用，其餘功能完全不受影響。
@@ -1176,8 +1176,8 @@ def save_browser_state(payload: dict) -> dict:
     """把瀏覽器 localStorage 的內容鏡像存成 mobile_state.json。
 
     頁面每次寫入 storage 後會呼叫這支 API。手機版是另一個瀏覽器、另一份
-    localStorage，看不到電腦上的編輯，這份鏡像就是 build_mobile.py 打包
-    時唯一拿得到使用者手動修改的來源。
+    localStorage，看不到電腦上的編輯，這份鏡像就是雲端快照唯一拿得到
+    使用者手動修改的來源。
 
     寫檔採「先寫暫存再取代」，避免建置腳本剛好讀到寫到一半的檔案。
     """
@@ -1244,6 +1244,21 @@ def read_prev_closes() -> dict:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def read_prices_with_basis() -> dict:
+    """讀 xlsx 現價，並附上今日損益需要的前一交易日基準。
+
+    /api/xlsx-prices 與手機／雲端版的快照都走這一支，兩邊結構才會一致。
+    少了基準的話手機上的今日損益卡片會一直顯示「需按一次取得盤後收盤價」，
+    而手機根本按不了那個按鈕。
+    """
+    data = read_xlsx_prices()
+    stored = read_prev_closes()
+    if stored.get("ok"):
+        data["prevCloses"] = stored.get("prevCloses") or {}
+        data["prevCloseDate"] = stored.get("priceDate") or ""
+    return data
+
+
 def read_portfolio_data() -> dict:
     """從主檔 HTML 取出 PORTFOLIO_DATA 這份歷史損益基準資料。
 
@@ -1299,7 +1314,7 @@ def build_snapshot() -> dict:
     替代來源，行為與讀不到資料時一致。
     """
     snapshot: dict[str, dict] = {}
-    for key, fn in (("prices", read_xlsx_prices),
+    for key, fn in (("prices", read_prices_with_basis),
                     ("balance", read_xlsx_balance),
                     ("weekly", read_xlsx_weekly)):
         try:
@@ -1438,13 +1453,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/xlsx-prices":
             try:
-                data = read_xlsx_prices()
-                # xlsx 只存現價，今日損益需要的基準另外從落地檔補上
-                stored = read_prev_closes()
-                if stored.get("ok"):
-                    data["prevCloses"] = stored.get("prevCloses") or {}
-                    data["prevCloseDate"] = stored.get("priceDate") or ""
-                self._send_json(200, data)
+                self._send_json(200, read_prices_with_basis())
             except Exception as exc:  # noqa: BLE001
                 traceback.print_exc()
                 self._send_json(500, {
