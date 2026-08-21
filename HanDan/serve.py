@@ -145,6 +145,33 @@ def collect_prices() -> dict:
         prices = {**esb, **realtime}  # 同一代號以即時報價為準
         if esb and fc.roc_to_iso(esb_date) != target_iso:
             log.append(f"⚠ 興櫃資料為 {fc.roc_to_iso(esb_date)} 收盤價，尚未更新至 {target_iso}")
+
+        # 即時報價對「當日無成交」的商品回 "-"，這類冷門 ETF 會整檔漏掉，
+        # 但官方每日檔仍有收盤價（實測 00944 官方檔 20.63、即時報價無成交）。
+        # 分兩層補齊，兩層都只在真的有缺漏時才做，不影響正常情況的速度：
+        #   1. 上市每日檔只要 0.6 秒，便宜，優先用它補。
+        #   2. 上櫃每日檔要 25 秒、而且常常還沒更新到當日，代價不成比例；
+        #      改用即時報價已經拿到的前一交易日收盤價頂替。當日無成交，
+        #      用昨收當現價與券商軟體一致，今日損益也會正確算成 0。
+        missing = [c for c in tracked if c not in prices]
+        if missing:
+            try:
+                twse, twse_raw = fc.fetch_twse_dated(target)
+                if twse and fc.roc_to_iso(twse_raw) == target_iso:
+                    hit = [c for c in missing if c in twse]
+                    for c in hit:
+                        prices[c] = twse[c]
+                    if hit:
+                        log.append(f"即時報價缺 {len(missing)} 檔，官方每日檔補上 {len(hit)} 檔")
+            except Exception as exc:  # noqa: BLE001
+                log.append(f"官方每日檔補抓失敗（{type(exc).__name__}）")
+
+            fallback = [c for c in tracked if c not in prices and c in prev_closes]
+            for c in fallback:
+                prices[c] = prev_closes[c]
+            if fallback:
+                log.append(f"{len(fallback)} 檔當日無成交，以前一交易日收盤價計")
+
         return _finalize_prices(prices, target_iso, target_iso, before_close, log, prev_closes)
 
     # --- 完整路徑：尚未收盤，或即時報價不可用 -----------------------------
