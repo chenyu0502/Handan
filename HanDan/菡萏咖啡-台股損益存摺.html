@@ -1954,6 +1954,7 @@ function renderStockTotals(rows, acc) {
 }
 
 function renderStockTable() {
+  flushPendingCellEdit();
   const acc = state.account;
   const all = (baseStocks(acc)).map(r => effectiveStock(acc, r));
   let rows = state.showSold ? all : all.filter(r => !effectiveSold(acc, r));
@@ -2049,6 +2050,24 @@ function bindEditableCells(acc) {
   });
 }
 
+// 進行中的儲存格編輯。表格一重繪就會把輸入框整個移除，blur 事件從此不會
+// 觸發，使用者剛打的數字會靜默消失、畫面還跳回舊值，看起來就像「改了卻
+// 沒有重算」。抓價完成與總覽同步都會重繪，編輯到一半很容易被打斷，因此
+// 重繪前先讓進行中的編輯落袋。
+let pendingCellEdit = null;
+
+function flushPendingCellEdit() {
+  const p = pendingCellEdit;
+  pendingCellEdit = null;
+  if (!p || p.isDone()) return;
+  const val = parseFloat(p.input.value);
+  if (isNaN(val)) return;      // 沒填或填了非數字就當作沒改
+  p.markDone();                // 讓稍後才觸發的 blur 不再重複提交
+  if (!state.fieldOverride[p.acc][p.id]) state.fieldOverride[p.acc][p.id] = {};
+  state.fieldOverride[p.acc][p.id][p.field] = val;
+  saveFieldOverrides(p.acc);   // 不 await：重繪不需要等 storage 寫完
+}
+
 function startCellEdit(td, acc) {
   if (td.querySelector('input')) return; // already editing
   const id = td.dataset.id;
@@ -2066,9 +2085,16 @@ function startCellEdit(td, acc) {
   input.select();
 
   let done = false;
+  pendingCellEdit = {
+    input, acc, id, field,
+    isDone: () => done,
+    markDone: () => { done = true; },
+  };
+
   const commit = async () => {
     if (done) return;
     done = true;
+    pendingCellEdit = null;
     const val = parseFloat(input.value);
     if (!isNaN(val)) {
       if (!state.fieldOverride[acc][id]) state.fieldOverride[acc][id] = {};
@@ -2083,6 +2109,7 @@ function startCellEdit(td, acc) {
   const cancel = () => {
     if (done) return;
     done = true;
+    pendingCellEdit = null;
     td.innerHTML = originalHTML;
   };
   input.addEventListener('blur', commit);
