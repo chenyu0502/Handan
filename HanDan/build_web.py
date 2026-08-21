@@ -17,7 +17,10 @@
 輸出 web/index.html，接著用 Vercel 部署 web/ 目錄即可。
 """
 
+import hashlib
+import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
@@ -76,6 +79,13 @@ GATE_MARKUP = """<div id="handan-gate">
     <div class="gate-note" id="gateNote"></div>
   </div>
 </div>
+<div id="handan-update">
+  <div class="upd-text">有新版本可以更新
+    <span class="upd-sub" id="updSub"></span>
+  </div>
+  <button class="upd-btn" id="updBtn">立即更新</button>
+  <button class="upd-close" id="updClose" title="稍後再說">&times;</button>
+</div>
 <style>
 #handan-gate{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;
   background:#0f1c30;padding:24px;}
@@ -89,6 +99,20 @@ GATE_MARKUP = """<div id="handan-gate">
 .gate-btn:hover{background:#1e3358;}
 .gate-btn:disabled{opacity:.55;cursor:default;}
 .gate-note{margin-top:14px;font-size:11.5px;color:#8a93a8;line-height:1.6;min-height:1em;}
+
+/* 有新版本時從底部滑入的提示條。固定在底部而非蓋住內容，
+   使用者可以先看完數字再決定要不要更新。 */
+#handan-update{position:fixed;left:0;right:0;bottom:0;z-index:10000;
+  display:none;align-items:center;gap:12px;
+  padding:12px 16px calc(12px + env(safe-area-inset-bottom));
+  background:#152647;color:#f7f2e4;box-shadow:0 -6px 24px rgba(0,0,0,.28);}
+#handan-update.show{display:flex;}
+.upd-text{flex:1;font-size:13px;line-height:1.5;}
+.upd-sub{display:block;font-size:11px;color:#9aa6bf;margin-top:2px;}
+.upd-btn{flex-shrink:0;border:none;border-radius:999px;cursor:pointer;
+  padding:8px 16px;background:#c9a02b;color:#22314f;font-size:13px;font-weight:700;}
+.upd-close{flex-shrink:0;border:none;background:none;cursor:pointer;
+  color:#9aa6bf;font-size:20px;line-height:1;padding:0 4px;}
 </style>
 """
 
@@ -97,6 +121,31 @@ BOOT_SCRIPT = """<script>
   var CONFIG = __CONFIG__;
   var ALLOWED_UID = '__UID__';
   var DOC_PATH = 'handan/snapshot';
+  var BUILD_VERSION = '__BUILD_VERSION__';
+
+  // 加到主畫面之後，Safari 會積極快取這個頁面，程式一改版使用者可能一直
+  // 開著舊的而不自知。主檔有 800 KB，不適合每次開啟都重抓來比對，因此另外
+  // 放一個幾十位元組的 version.json，每次載入只問它一次。
+  // 版本號是頁面內容的雜湊：內容沒變就不會變，不會冒出沒意義的更新提示。
+  function checkForUpdate() {
+    fetch('version.json?t=' + Date.now(), { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (info) {
+        if (!info || !info.version || info.version === BUILD_VERSION) return;
+        var bar = document.getElementById('handan-update');
+        document.getElementById('updSub').textContent =
+          '目前 ' + BUILD_VERSION + '　→　最新 ' + info.version +
+          (info.builtAt ? '（' + info.builtAt + '）' : '');
+        document.getElementById('updBtn').onclick = function () {
+          // 帶上版本參數繞過快取，否則點了可能又載到同一份舊檔
+          location.replace(location.pathname + '?v=' + encodeURIComponent(info.version));
+        };
+        document.getElementById('updClose').onclick = function () { bar.classList.remove('show'); };
+        bar.classList.add('show');
+      })
+      .catch(function () { /* 離線或取不到就安靜略過，不干擾使用 */ });
+  }
+  checkForUpdate();
 
   var gate    = document.getElementById('handan-gate');
   var gateBtn = document.getElementById('gateBtn');
@@ -292,14 +341,36 @@ def main() -> int:
     html = must_replace_last(html, "<body>\n", "<body>\n" + GATE_MARKUP, "body 起始標籤")
     html = must_replace_last(html, "</body>", boot + "</body>", "body 結束標籤")
 
+    # 5. 版本號取頁面內容的雜湊，在填入版本之前計算。內容沒變雜湊就一樣，
+    #    重跑建置不會憑空生出新版本，也就不會冒出沒意義的更新提示。
+    version = hashlib.sha256(html.encode("utf-8")).hexdigest()[:8]
+    built_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    html = must_replace(html, "__BUILD_VERSION__", version, "版本號佔位符")
+
     OUT_DIR.mkdir(exist_ok=True)
     OUT.write_text(html, encoding="utf-8")
 
+    # 供頁面查詢目前線上版本。只有幾十位元組，因此可以每次載入都問一次，
+    # 不必為了比對版本重抓 800 KB 的主檔。
+    (OUT_DIR / "version.json").write_text(
+        json.dumps({"version": version, "builtAt": built_at}, ensure_ascii=False),
+        encoding="utf-8")
+
+    # version.json 必須永遠取到最新的，否則它自己被快取住就失去意義了。
+    # 主檔維持可快取，換頁才不會每次都重新下載。
+    (OUT_DIR / "vercel.json").write_text(json.dumps({
+        "headers": [{
+            "source": "/version.json",
+            "headers": [{"key": "Cache-Control", "value": "no-store, max-age=0"}],
+        }]
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
     print(f"[完成] 已產生 {OUT.relative_to(BASE)}")
     print(f"       檔案大小：{len(html.encode('utf-8')):,} bytes")
+    print(f"       版本號　：{version}（{built_at}）")
     print(f"       資料來源：Firestore {FIREBASE_CONFIG.splitlines()[3].strip()}")
     print()
-    print("接著部署 web/ 目錄到 Vercel 即可。")
+    print("接著部署 handan-web/ 目錄到 Vercel 即可。")
     return 0
 
 
