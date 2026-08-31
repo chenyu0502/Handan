@@ -56,6 +56,8 @@ python build_web.py
 cd handan-web && vercel deploy --prod --yes
 ```
 
+**`vercel deploy` often reports `"status": "error"` on the first run and succeeds on an immediate retry** — seen three times now. Nothing was uploaded when that happens, so always confirm by fetching the live `version.json` and checking it matches the version the build just printed; do not trust the CLI's exit output alone.
+
 **The day-to-day flow needs nothing from Claude at all**: the user opens `開啟存摺.bat`, edits and hits 「取得盤後收盤價」 in the page, and `serve.py` pushes the snapshot to Firestore automatically, so the phone is already current. Only rebuild and redeploy when the *page code itself* changes — a data-only change never needs it.
 
 The `更新手機版` request therefore means "the app changed, redeploy it", not "sync my data".
