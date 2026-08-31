@@ -3883,6 +3883,14 @@ function renderAll() {
     fetchPriceBtn.disabled = true;
     fetchPriceBtn.textContent = '取得中…';
     const statusEl = document.getElementById('fetchPriceStatus');
+
+    // 週記帳與帳戶餘額原本只在開啟頁面時讀一次。實務上使用者是先在 Excel
+    // 補完當週記帳、再回網頁按這個按鈕，若只更新價格，「當週損益」會沿用
+    // 開啟當下的舊基準，把上一週的損益也算進當週，數字會整整多一週。
+    // 這裡先重讀一次，再抓價，最後由 fetchClosePrice 統一重繪。
+    await loadXlsxWeekly();
+    await loadAccountBalanceBaseline();
+
     await fetchClosePrice(statusEl, syncXlsx);
     fetchPriceBtn.disabled = false;
     fetchPriceBtn.textContent = '取得盤後收盤價';
