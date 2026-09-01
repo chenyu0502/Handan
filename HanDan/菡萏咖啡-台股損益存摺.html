@@ -2563,14 +2563,27 @@ function effectiveDivValue(acc, etfName, monthKey) {
 
 // Effective ETF row – merges field overrides (qty/price from holdings) + div overrides
 function effectiveEtf(acc, r) {
-  // pick up qty/price edits from holdings linkage
-  const stockRow = (baseStocks(acc) || []).find(s => s.name === r.name && s.type === 'etf');
-  const eff = stockRow ? effectiveStock(acc, stockRow) : r;
-  const qty = eff.qty != null ? eff.qty : r.qty;
-  const price = eff.price != null ? eff.price : r.price;
-  const avgPrice = eff.avg_price != null ? eff.avg_price : null;
-  const cost = avgPrice != null && qty != null ? qty * avgPrice : (eff.cost || r.cost || null);
-  const value = qty != null && price != null ? qty * price : (eff.value || r.value || null);
+  // 從持股明細帶入使用者編輯過的股數／單價／現價。
+  // 同一檔 ETF 在清單裡可能有多筆（分批買進留下的歷史列）。原本用 find 取
+  // 第一筆，而且不管它是不是已經賣出——已賣出的列停在賣出當時的價格與成本，
+  // 拿它來算會讓現價、損益、ROI 全部失真（實測 00937B 現價顯示 14.81 而不是
+  // 14.25，ROI 差了 15 個百分點）。改為只看仍持有的列；真有多筆未賣出時
+  // 合併計算：股數與成本相加，均價取加權平均。
+  const effs = (baseStocks(acc) || [])
+    .filter(s => s.name === r.name && s.type === 'etf' && !effectiveSold(acc, s))
+    .map(s => effectiveStock(acc, s));
+
+  let qty = r.qty, price = r.price, avgPrice = null;
+  if (effs.length) {
+    qty = effs.reduce((sum, e) => sum + (e.qty || 0), 0);
+    const totalCost = effs.reduce((sum, e) => sum + (e.cost || 0), 0);
+    avgPrice = qty ? totalCost / qty : null;
+    const priced = effs.filter(e => e.price != null);
+    if (priced.length) price = priced[priced.length - 1].price;
+  }
+
+  const cost = avgPrice != null && qty != null ? qty * avgPrice : (r.cost || null);
+  const value = qty != null && price != null ? qty * price : (r.value || null);
   // dividend totals from overrides + base data
   const totalDiv = MONTHS_EN.reduce((s, m) => {
     const v = effectiveDivValue(acc, r.name, m);
@@ -2902,8 +2915,14 @@ async function openStockDivEntryModal(td, acc) {
   // 下面的提示文字裡（不放進輸入框），供查閱、不會被誤送出。
   const prefill = detail.imported ? {} : detail;
 
-  const r = (baseStocks(acc) || []).find(s => s.name === stockName && s.type === 'stock');
-  const qty = r ? (effectiveStock(acc, r).qty || 0) : 0;
+  // 同一檔商品在清單裡可能有多筆（分批買進留下的歷史列）。配息是按總持股
+  // 發放，只取第一筆會嚴重低估——冠德就是清單裡有 200 股與 2,200 股兩列，
+  // 而視窗只顯示 200。這裡加總所有仍持有的筆數，已標記賣出或暫停列入計算
+  // 的不算，這樣把多筆合併到其中一列之後，數字也會跟著正確。
+  const rows = (baseStocks(acc) || []).filter(s =>
+    s.name === stockName && s.type === 'stock'
+    && !effectiveSold(acc, s) && !effectiveCalcExcluded(acc, s));
+  const qty = rows.reduce((sum, s) => sum + (effectiveStock(acc, s).qty || 0), 0);
   const monthNum = MONTHS_EN.indexOf(monthKey) + 1;
 
   const modal = document.createElement('div');
