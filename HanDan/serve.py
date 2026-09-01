@@ -82,6 +82,15 @@ def _finalize_prices(prices: dict, iso: str, target_iso: str, before_close: bool
     """
     wanted = set(fc.ETF_CODES) | set(fc.STOCK_CODE_MAP.values())
     prev = prev_closes or {}
+    missing = sorted(wanted - prices.keys())
+
+    # 中間那幾行「某來源缺幾檔、由另一個來源補上」講的是過程，很容易被讀成
+    # 「現在還缺著」。最後明講最終結果，才不會讓人以為抓價沒抓完。
+    log.append(f"持股 {len(wanted)} 檔全數取得"
+               if not missing else
+               f"⚠ 持股 {len(wanted)} 檔僅取得 {len(wanted) - len(missing)} 檔，"
+               f"未取得：{'、'.join(missing)}")
+
     return {
         "ok": True,
         "date": iso,
@@ -89,7 +98,7 @@ def _finalize_prices(prices: dict, iso: str, target_iso: str, before_close: bool
         "beforeClose": before_close,
         "prices": {c: prices[c] for c in wanted if c in prices},
         "prevCloses": {c: prev[c] for c in wanted if c in prev},
-        "missing": sorted(wanted - prices.keys()),
+        "missing": missing,
         "unresolved": fc.UNRESOLVED,
         "log": log,
         "fetchedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -138,7 +147,7 @@ def collect_prices() -> dict:
         esb_date = ""
         try:
             esb, _esb_src, esb_date = fc.fetch_tpex_esb()
-            log.append(f"興櫃：{len(esb)} 檔" if esb else "興櫃：所有候選端點皆無回應")
+            log.append(f"興櫃資料集：{len(esb)} 檔" if esb else "興櫃：所有候選端點皆無回應")
         except Exception as exc:  # noqa: BLE001
             log.append(f"興櫃抓取失敗（{type(exc).__name__}）")
 
@@ -162,7 +171,7 @@ def collect_prices() -> dict:
                     for c in hit:
                         prices[c] = twse[c]
                     if hit:
-                        log.append(f"即時報價缺 {len(missing)} 檔，官方每日檔補上 {len(hit)} 檔")
+                        log.append(f"{len(hit)} 檔當日無成交，已改由官方每日檔取得")
             except Exception as exc:  # noqa: BLE001
                 log.append(f"官方每日檔補抓失敗（{type(exc).__name__}）")
 
@@ -201,7 +210,7 @@ def collect_prices() -> dict:
     esb_date = ""
     try:
         esb, esb_src, esb_date = fc.fetch_tpex_esb()
-        log.append(f"興櫃：{len(esb)} 檔" if esb else "興櫃：所有候選端點皆無回應")
+        log.append(f"興櫃資料集：{len(esb)} 檔" if esb else "興櫃：所有候選端點皆無回應")
     except Exception as exc:  # noqa: BLE001
         esb = {}
         log.append(f"興櫃抓取失敗（{type(exc).__name__}）")
