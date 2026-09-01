@@ -310,8 +310,22 @@ def fetch_realtime_quotes(codes: list[str]) -> tuple[dict[str, float], dict[str,
 
         for row in data.get("msgArray", []):
             code = row.get("c")
+            if not code:
+                continue
+
+            # 前一交易日收盤價（y）跟當日有沒有成交無關，先收下來再說。
+            # 當日無成交的商品成交價欄位是 "-"，但 y 仍然有值；早期版本在
+            # 成交價無效時整筆跳過，連帶把 y 也丟掉，那些商品就完全沒有
+            # 比較基準，今日損益會整檔漏算（實測 00944 因此短少 3,700）。
+            try:
+                prev = float(row.get("y"))
+                if prev > 0:
+                    prev_closes[code] = prev
+            except (TypeError, ValueError):
+                pass
+
             z = row.get("z")  # 最後成交價；收盤後即為當日收盤價。
-            if not code or not z or z == "-":
+            if not z or z == "-":
                 continue
             try:
                 value = float(z)
@@ -322,15 +336,6 @@ def fetch_realtime_quotes(codes: list[str]) -> tuple[dict[str, float], dict[str,
 
             prices[code] = value
             date = date or (row.get("d") or "")
-
-            # y 是前一交易日收盤價。無成交的商品這欄可能是 "-" 或 0，
-            # 直接跳過，讓呼叫端把該檔視為算不出今日漲跌。
-            try:
-                prev = float(row.get("y"))
-                if prev > 0:
-                    prev_closes[code] = prev
-            except (TypeError, ValueError):
-                pass
 
     return prices, prev_closes, date
 
