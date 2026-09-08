@@ -1029,14 +1029,17 @@ function effectiveBalance(acc) {
   return state.accountBalanceBaseline[acc];
 }
 
-// 本週（今天所在的星期一～星期日）所有交易的投資明細加總：賣出正、買進負，
-// 見 renderWeeklyTxSummary()。還沒按「匯入」併入帳戶餘額前，這筆錢已經動用
-// 或收回，但帳戶餘額本身還沒反映，所以可用現金要另外加上這一段。
+// 本週（今天所在的星期一～星期日）「尚未匯入」的交易投資明細加總：賣出正、
+// 買進負，見 renderWeeklyTxSummary()。還沒按「匯入」併入帳戶餘額前，這筆錢
+// 已經動用或收回，但帳戶餘額本身還沒反映，所以可用現金要另外加上這一段。
+// 已標記 imported 的交易代表金額早就併進帳戶餘額了，必須跳過，否則同一筆錢
+// 會在帳戶餘額與這裡各扣一次（見 importWeeklyTx）。
 function currentWeekTxNet(acc) {
   const { key: todayWeekKey } = weekRangeOf(todayISO());
   let net = 0;
   for (const y of Object.keys(state.customTransactions[acc])) {
     (state.customTransactions[acc][y] || []).forEach(e => {
+      if (e.imported) return;
       if (weekRangeOf(e.date).key === todayWeekKey) {
         net += (e.side === 'sell' ? e.amount : -e.amount);
       }
@@ -1045,10 +1048,10 @@ function currentWeekTxNet(acc) {
   return net;
 }
 
-// 可用現金：手動覆寫值優先；否則＝帳戶餘額＋當週的投資明細（見
-// currentWeekTxNet）。「當週」是指今天所在的這一週，通常要等這週過完、按下
-// 「匯入」把投資明細併入帳戶餘額後才不會重複算——若在當週交易還沒結束前就
-// 提早按「匯入」，這裡會跟已併入的金額重複計算，需自行留意。
+// 可用現金：手動覆寫值優先；否則＝帳戶餘額＋當週尚未匯入的投資明細（見
+// currentWeekTxNet）。「當週」是指今天所在的這一週。按下「匯入」後那幾筆會
+// 被標記為已匯入並從這裡排除，所以本週隨時都可以匯入，不必等整週結束。
+// 手動覆寫值可在該欄位輸入空白清除，清除後恢復為這裡的計算值。
 function effectiveCash(acc) {
   const ov = state.accountFinance[acc].cash;
   if (ov != null) return ov;
@@ -1854,7 +1857,7 @@ function renderAccountFinance(containerId, acc) {
     <div class="metric-card">
       <div class="m-label">${label}<\/div>
       <div class="m-value editable-cell" data-acc="${acc}" data-kind="${kind}"
-           data-raw="${value != null ? value : ''}" title="點一下可修改數值">
+           data-raw="${value != null ? value : ''}" title="點一下可修改數值；清空後送出可清除手動覆寫">
         ${value != null ? fmtMoney(value) : '尚未設定'}
       <\/div>
     <\/div>`;
@@ -1895,6 +1898,21 @@ function startFinanceEdit(span) {
   const commit = async () => {
     if (done) return;
     done = true;
+    // 清空後送出＝清除手動覆寫，讓該欄位回到計算值（可用現金）或 xlsx 基準值
+    // （帳戶餘額、未入帳配息）。沒有這條路徑的話，覆寫一旦寫進去就永遠拿不掉，
+    // 該欄位會停在當時的數字不再更新。
+    // badInput 要另外擋：number 欄位收到解析不了的內容（例如「1,000」）時
+    // value 同樣是空字串，那是打錯字不是要清除，必須還原而不是清掉覆寫。
+    if (input.validity && input.validity.badInput) {
+      span.innerHTML = originalHTML;
+      return;
+    }
+    if (input.value.trim() === '') {
+      delete state.accountFinance[acc][kind];
+      await saveAccountFinance(acc);
+      renderAccountFinanceAll();
+      return;
+    }
     const val = parseFloat(input.value);
     if (!isNaN(val)) {
       state.accountFinance[acc][kind] = val;
@@ -3751,15 +3769,18 @@ function weekRangeOf(dateISO) {
 // （負），所以投資明細＝賣出−買進，不是兩者相加。純由交易明細即時算出，
 // 不另外存檔。
 function renderWeeklyTxSummary() {
-  const groups = new Map(); // `${acc}:${weekKey}` -> {acc, weekKey, label, buy, sell}
+  const groups = new Map(); // `${acc}:${weekKey}` -> {acc, weekKey, label, buy, sell, pending}
   for (const acc of ['main','keqiang']) {
     for (const y of Object.keys(state.customTransactions[acc])) {
       (state.customTransactions[acc][y] || []).forEach(e => {
         const { key: weekKey, label } = weekRangeOf(e.date);
         const groupKey = `${acc}:${weekKey}`;
-        if (!groups.has(groupKey)) groups.set(groupKey, { acc, weekKey, label, buy: 0, sell: 0 });
+        if (!groups.has(groupKey)) groups.set(groupKey, { acc, weekKey, label, buy: 0, sell: 0, pending: 0 });
         const g = groups.get(groupKey);
         if (e.side === 'sell') g.sell += e.amount; else g.buy += e.amount;
+        // 買進／賣出欄位是整週的帳面加總（跟 Excel 週記帳同口徑），不因匯入而改變；
+        // pending 只數還沒併進帳戶餘額的筆數，決定「匯入」按鈕還能不能按。
+        if (!e.imported) g.pending++;
       });
     }
   }
@@ -3783,22 +3804,39 @@ function renderWeeklyTxSummary() {
       <td>${fmtMoney(r.buy)}<\/td>
       <td>${fmtMoney(r.sell)}<\/td>
       <td class="${pnlClass(net)}">${fmtMoney(net)}<\/td>
-      <td><button class="btn ghost" data-import-acc="${r.acc}" data-import-net="${net}">匯入<\/button><\/td>
+      <td>${r.pending
+        ? `<button class="btn ghost" data-import-acc="${r.acc}" data-import-week="${r.weekKey}">匯入<\/button>`
+        : '<button class="btn ghost" disabled>已匯入 ✓<\/button>'}<\/td>
     <\/tr>`;
   }).join('')}<\/tbody>`;
   table.innerHTML = thead + tbody;
   table.querySelectorAll('[data-import-acc]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const acc = btn.dataset.importAcc;
-      const net = Number(btn.dataset.importNet);
-      const current = effectiveBalance(acc) || 0;
-      state.accountFinance[acc].balance = current + net;
-      await saveAccountFinance(acc);
-      renderAccountFinanceAll();
-      btn.textContent = '已匯入 ✓';
-      btn.disabled = true;
-    });
+    btn.addEventListener('click', () => importWeeklyTx(btn.dataset.importAcc, btn.dataset.importWeek));
   });
+}
+
+// 把某個帳戶、某一週「尚未匯入」的交易併進帳戶餘額，並逐筆標記 imported。
+// 淨額在按下按鈕的當下重新掃描計算，不沿用畫面上算好的值，避免表格沒重繪時
+// 用到過期數字；標記後 currentWeekTxNet 就不會再算同一筆，可用現金因此不會
+// 重複扣款。已匯入的交易之後被刪除時不回沖帳戶餘額，與配息刪除的處理一致。
+async function importWeeklyTx(acc, weekKey) {
+  let net = 0;
+  const touchedYears = new Set();
+  for (const y of Object.keys(state.customTransactions[acc])) {
+    (state.customTransactions[acc][y] || []).forEach(e => {
+      if (e.imported) return;
+      if (weekRangeOf(e.date).key !== weekKey) return;
+      net += (e.side === 'sell' ? e.amount : -e.amount);
+      e.imported = true;
+      touchedYears.add(y);
+    });
+  }
+  if (touchedYears.size === 0) return; // 已經全部匯入過，不重複加減
+  state.accountFinance[acc].balance = (effectiveBalance(acc) || 0) + net;
+  for (const y of touchedYears) await saveCustomTransactions(acc, y);
+  await saveAccountFinance(acc);
+  renderWeeklyTxSummary();
+  renderAccountFinanceAll();
 }
 
 /* ---------------- master render ---------------- */
