@@ -98,6 +98,8 @@ Both scripts share the same closing-price logic (`serve.py` imports `fetch_close
 
 When adding/removing holdings, update `ETF_CODES` / `STOCK_CODE_MAP` in `fetch_close.py` **and** the matching `STOCK_CODE_MAP`/ETF list embedded in the HTML (`菡萏咖啡-台股損益存摺.html:1155`) — they must stay in sync since the front end maps stock names to codes independently for its own display.
 
+`mergeTxIntoHoldings()` (04 記一筆 → 持股明細) can create a holding row for a product in neither map, so a position may now exist that the price fetch never covers. The UI says so when it happens ("取盤後收盤價時抓不到現價"), but the maps still need updating by hand before prices start flowing. Note how new rows are added: appended to `state.confirmedStocks[acc]` with **qty 0**, with the real position written to `fieldOverride`. Writing the figures straight into the baseline would make `computeLiveDelta` see a zero diff, and 總覽's 庫存市值 would silently not move.
+
 `serve.py`'s `BASE_DIR` resolves via `sys.executable`'s parent when `sys.frozen` is set (running as the PyInstaller exe), falling back to `Path(__file__).resolve().parent` otherwise — this is deliberate, not defensive boilerplate: under PyInstaller onefile, `__file__` points into the temp `_MEIPASS` extraction directory, which would make the exe read/write a throwaway copy of the xlsx instead of the real one sitting next to it. If BASE_DIR-based path logic changes, keep this frozen/unfrozen branch working, and re-test by running the actual `.exe` (not just `python serve.py`) after any such change.
 
 **Known TPEx gotchas (fixed 2026-07-31, don't re-diagnose from scratch if they resurface):**
