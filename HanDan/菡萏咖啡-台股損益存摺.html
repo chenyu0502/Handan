@@ -400,7 +400,9 @@ tr.row-calc-excluded td:not(:last-child){opacity:0.6;}
 .div-val{display:block;}
 .div-edited{color:var(--gold);font-weight:600;}
 /* 配息日期已過、但這筆配息還沒按「匯入」：粗體紅字提醒該匯入了 */
-.div-overdue{color:var(--loss)!important;font-weight:700;}
+/* 入帳日已到卻還沒匯入：用 --gain（紅）與分頁按鈕的提示同色。原本是
+   --loss，在這套「漲紅跌綠」的配色裡會顯示成綠字，跟提示的意思相反。 */
+.div-overdue{color:var(--gain)!important;font-weight:700;}
 tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--paper-line);}
 .yield-complete{font-weight:700;}
 
