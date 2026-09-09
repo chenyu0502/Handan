@@ -169,6 +169,38 @@ body{
   color:var(--paper);
   border-color:var(--ink);
 }
+/* 有配息日期已到、卻還沒按「匯入」的紀錄時，把該分頁按鈕轉紅並緩慢閃爍。
+   規則寫在 .tab-btn.active 之後，兩者選擇器權重相同，靠順序讓提示色蓋過
+   選取色，這樣人已經站在該分頁上時提示也不會消失。 */
+.tab-btn.tab-alert{
+  background:var(--gain);
+  border-color:var(--gain);
+  color:#fff;
+  animation:tabAlertPulse 1.6s ease-in-out infinite;
+}
+.tab-btn.tab-alert:hover{color:#fff;}
+.tab-alert-count{
+  display:inline-block;
+  margin-left:6px;
+  min-width:18px;
+  padding:0 5px;
+  border-radius:999px;
+  background:#fff;
+  color:var(--gain);
+  font-family:'IBM Plex Mono',monospace;
+  font-size:12px;
+  font-weight:700;
+  line-height:18px;
+  text-align:center;
+}
+@keyframes tabAlertPulse{
+  0%,100%{box-shadow:0 0 0 0 rgba(194,59,59,.5);}
+  50%{box-shadow:0 0 0 6px rgba(194,59,59,0);}
+}
+/* 系統層級關掉動態效果時只留紅底，不閃爍 */
+@media (prefers-reduced-motion:reduce){
+  .tab-btn.tab-alert{animation:none;}
+}
 .panel{display:none;}
 .panel.active{display:block;animation:fadeIn .25s ease;}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:translateY(0);}}
@@ -2713,6 +2745,58 @@ function renderDivTypeFilter() {
   if (clearBtn) clearBtn.style.display = state.divTypeFilter === 'etf' ? '' : 'none';
 }
 
+/* ---------------- 配息待匯入提示 ---------------- */
+// 配息日期（入帳日）已到、卻還沒按「匯入」的一筆紀錄。ETF 表格、個股表格
+// 與分頁按鈕共用這個判斷，三處才不會出現一邊亮一邊不亮的情況。
+// 用 <= 而不是 <：欄位填的是入帳日，錢當天就到了，當天就該提醒去匯入。
+// 原本的寫法是 <，會晚一天才亮；要改回舊行為只需要動這一個比較符號。
+function isDivOverdue(detail) {
+  return !!(detail && !detail.imported && detail.date && detail.date <= todayISO());
+}
+
+// 掃兩個帳戶的 ETF（divDetail）與個股（divStockDetail）配息明細，回傳所有
+// 日期已到卻還沒匯入的紀錄，依日期由舊到新排序。分頁按鈕是兩個帳戶共用的，
+// 所以這裡刻意不看 state.account——只看目前帳戶的話，切到另一個帳戶就會把
+// 提示藏起來，等於漏掉該處理的配息。
+function pendingDivImports() {
+  const items = [];
+  for (const acc of ['main', 'keqiang']) {
+    for (const [store, kind] of [[state.divDetail, 'etf'], [state.divStockDetail, 'stock']]) {
+      const byName = store[acc] || {};
+      for (const name of Object.keys(byName)) {
+        const byMonth = byName[name] || {};
+        for (const m of Object.keys(byMonth)) {
+          if (isDivOverdue(byMonth[m])) {
+            items.push({ acc, name, kind, month: m, date: byMonth[m].date });
+          }
+        }
+      }
+    }
+  }
+  return items.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+// 把「03 存股與配息」分頁按鈕轉紅閃爍並標上待匯入筆數，滑鼠停留可看到是
+// 哪幾筆。兩個配息表格重繪時都會呼叫，而登記、匯入、刪除之後本來就會重繪
+// 表格，所以那些流程不必各自再處理一次提示。
+function renderDivAlert() {
+  const btn = document.querySelector('.tab-btn[data-tab="etf"]');
+  if (!btn) return;
+  // 原始標題只在第一次讀，之後按鈕內容會被加上筆數徽章，不能再拿來當來源
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent.trim();
+  const items = pendingDivImports();
+  btn.classList.toggle('tab-alert', items.length > 0);
+  if (items.length === 0) {
+    btn.textContent = btn.dataset.label;
+    btn.removeAttribute('title');
+    return;
+  }
+  btn.innerHTML = `${btn.dataset.label}<span class="tab-alert-count">${items.length}<\/span>`;
+  btn.title = '配息日期已到、尚未匯入：\n' + items
+    .map(i => `${ACC_LABEL[i.acc]}　${i.name}　${MONTHS_EN.indexOf(i.month) + 1}月　${i.date}`)
+    .join('\n');
+}
+
 /* ---------------- etf table ---------------- */
 function renderEtfTable() {
   if (state.divTypeFilter === 'stock') {
@@ -2763,8 +2847,7 @@ function renderEtfTable() {
       const isExpected = expected.has(m);
       const cellCls = isExpected ? tierCls : '';
       const isEdited = (state.divOverride[acc]?.[r.name]?.[m]) !== undefined;
-      const detail = state.divDetail[acc]?.[r.name]?.[m];
-      const isOverdue = !!(detail && !detail.imported && detail.date && detail.date < todayISO());
+      const isOverdue = isDivOverdue(state.divDetail[acc]?.[r.name]?.[m]);
       return `<td class="div-month-cell ${cellCls}" data-etf="${r.name}" data-month="${m}">
         <span class="div-val ${isEdited ? 'div-edited' : ''} ${isOverdue ? 'div-overdue' : ''}">${val ? Math.round(val).toLocaleString('zh-TW') : ''}<\/span>
       <\/td>`;
@@ -2788,6 +2871,7 @@ function renderEtfTable() {
   <\/tbody>`;
 
   document.getElementById('etfTable').innerHTML = thead + tbody;
+  renderDivAlert();
   bindSortHandlers('etf', renderEtfTable);
 
   // bind type picker buttons
@@ -2842,8 +2926,7 @@ function renderStockDivTable() {
       const monthCells = MONTHS_EN.map(m => {
         const val = effectiveStockDivValue(acc, r.name, m);
         const isEdited = val !== null;
-        const detail = state.divStockDetail[acc]?.[r.name]?.[m];
-        const isOverdue = !!(detail && !detail.imported && detail.date && detail.date < todayISO());
+        const isOverdue = isDivOverdue(state.divStockDetail[acc]?.[r.name]?.[m]);
         return `<td class="div-month-cell div-stock-cell" data-stock="${r.name}" data-month="${m}">
           <span class="div-val ${isEdited ? 'div-edited' : ''} ${isOverdue ? 'div-overdue' : ''}">${val != null ? Math.round(val).toLocaleString('zh-TW') : ''}<\/span>
         <\/td>`;
@@ -2863,6 +2946,7 @@ function renderStockDivTable() {
   <\/tbody>`;
 
   document.getElementById('etfTable').innerHTML = thead + tbody;
+  renderDivAlert();
 
   // bind dividend entry popup
   document.querySelectorAll('.div-stock-cell').forEach(td => {
@@ -3854,6 +3938,7 @@ function renderAll() {
   safe(renderAccountFinanceAll, 'accountFinance');
   safe(renderDivTypeFilter, 'divTypeFilter');
   safe(renderEtfTable, 'etfTable');
+  safe(renderDivAlert, 'divAlert'); // 配息表格若渲染失敗，提示仍要照常算出來
   safe(renderWeeklyTxSummary, 'weeklyTxSummaryTable');
   safe(renderCustomTable, 'customTable');
 }
