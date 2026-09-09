@@ -365,6 +365,11 @@ tbody tr:hover{background:rgba(201,160,43,0.06);}
   font-size:10px;color:var(--gold);border:1px solid var(--gold);
   border-radius:4px;padding:1px 5px;margin-left:6px;font-family:'IBM Plex Mono',monospace;
 }
+/* 這筆交易已併進持股明細的庫存數量與平均單價；沒有這個標記的是舊紀錄 */
+.tag-merged{
+  font-size:10px;color:var(--div-quarterly);border:1px solid var(--div-quarterly);
+  border-radius:4px;padding:1px 5px;margin-left:6px;font-family:'IBM Plex Mono',monospace;
+}
 .empty-note{
   color:var(--ink-soft);font-size:13px;padding:16px;text-align:center;
   border:1px dashed var(--paper-line);border-radius:10px;
@@ -3733,6 +3738,110 @@ function openDivSchedulePicker(etfName, acc, anchorBtn) {
   }, 50);
 }
 
+/* ---------------- 記一筆 → 持股明細 自動合併 ---------------- */
+// 兩個商品是不是同一檔：先比代號，代號查不到（例如已下市或不在
+// STOCK_CODE_MAP 裡的舊部位）才退回比名稱。「04 記一筆」的商品欄位可以直接
+// 填代號（8046）也可以填名稱（南電），codeForName 兩種都對得到同一個代號。
+function sameProductAs(nameA, nameB) {
+  const ca = codeForName(nameA);
+  const cb = codeForName(nameB);
+  if (ca && cb) return ca === cb;
+  return nameA === nameB;
+}
+
+// 新持股列的 id。沿用既有的 `${acc}-<流水號>` 格式，取目前最大號 +1——
+// 持股明細匯出成 Excel 時這個 id 就是「系統代碼」欄，換成別的格式會讓
+// 匯入端對不回來。
+function nextStockId(acc) {
+  let max = -1;
+  (baseStocks(acc) || []).forEach(s => {
+    const m = /^.+-(\d+)$/.exec(s.id || '');
+    if (m) max = Math.max(max, Number(m[1]));
+  });
+  return `${acc}-${max + 1}`;
+}
+
+// 把一筆「04 記一筆」的交易併進持股明細。
+//
+// 買進：股數相加、成本相加，平均單價＝新成本÷新股數。
+// 賣出：採移動平均法，平均單價不動，只減股數（成本＝剩餘股數×平均單價）。
+//       賣到剛好 0 股就把該列標記為「已賣出」，不再寫股數覆寫——這樣該列
+//       在已賣出清單裡仍看得到當時的部位，日後取消勾選也能還原。
+//
+// 數字一律寫進 fieldOverride，跟手動編輯「庫存數量／平均單價」走同一條路徑，
+// 之後按「確認並存檔」會一起烘進基準值。找不到商品又是買進時，先在基準值
+// 補一列「0 股」的空列，實際部位仍放在 fieldOverride——若把數字直接寫進基準
+// 值，computeLiveDelta 會算出 0 差額，總覽的庫存市值就不會跟著增加。
+//
+// 回傳 { ok, msg }；ok 為 false 代表這筆不該記錄，msg 是要顯示的原因。
+function mergeTxIntoHoldings(acc, entry) {
+  const rows = (baseStocks(acc) || []).filter(s =>
+    sameProductAs(s.name, entry.name)
+    && !effectiveSold(acc, s)
+    && !effectiveCalcExcluded(acc, s));
+
+  if (rows.length === 0) {
+    if (entry.side === 'sell') {
+      return { ok: false, msg: `持股明細裡沒有${ACC_LABEL[acc]}的「${entry.name}」，無法賣出。請先確認商品名稱或代號是否正確。` };
+    }
+    // 買進全新商品：補一列 0 股的基準列，實際股數與成本走 fieldOverride
+    const code = codeForName(entry.name);
+    const isEtf = !!(code && /^00/.test(code));
+    const id = nextStockId(acc);
+    if (!state.confirmedStocks[acc]) {
+      state.confirmedStocks[acc] = (baseStocks(acc) || []).map(s => ({ ...s }));
+    }
+    state.confirmedStocks[acc].push({
+      name: entry.name, qty: 0, avg_price: 0, cost: 0,
+      price: entry.avgCost, value: 0, pnl: 0, perf: 0,
+      sold: false, type: isEtf ? 'etf' : 'stock', id, edited: false,
+    });
+    state.fieldOverride[acc][id] = { qty: entry.qty, avg_price: entry.avgCost };
+    const untracked = !STOCK_CODE_MAP[entry.name] && !/^\d/.test(entry.name);
+    return {
+      ok: true, created: true, id,
+      msg: `已在${ACC_LABEL[acc]}的持股明細新增「${entry.name}」${fmtInt(entry.qty)} 股，平均單價 ${entry.avgCost}。`
+        + (untracked ? '　這檔還沒收錄在代號對照表裡，取盤後收盤價時抓不到現價。' : ''),
+    };
+  }
+
+  const row = rows[0];
+  const eff = effectiveStock(acc, row);
+  const curQty = eff.qty || 0;
+  const curAvg = eff.avg_price || 0;
+
+  if (entry.side === 'buy') {
+    const newQty = curQty + entry.qty;
+    const newCost = (eff.cost || 0) + entry.amount;
+    const newAvg = newQty ? newCost / newQty : 0;
+    state.fieldOverride[acc][row.id] = { ...(state.fieldOverride[acc][row.id] || {}), qty: newQty, avg_price: newAvg };
+    return {
+      ok: true, id: row.id,
+      msg: `已併入${ACC_LABEL[acc]}的「${row.name}」：${fmtInt(curQty)} → ${fmtInt(newQty)} 股，`
+        + `平均單價 ${curAvg.toFixed(4)} → ${newAvg.toFixed(4)}，成本 ${fmtMoney(newCost)}。`,
+    };
+  }
+
+  if (entry.qty > curQty) {
+    return { ok: false, msg: `${ACC_LABEL[acc]}的「${row.name}」目前只有 ${fmtInt(curQty)} 股，不足以賣出 ${fmtInt(entry.qty)} 股。` };
+  }
+
+  const newQty = curQty - entry.qty;
+  if (newQty === 0) {
+    state.soldOverride[acc][row.id] = true;
+    return {
+      ok: true, id: row.id, sold: true,
+      msg: `已賣光${ACC_LABEL[acc]}的「${row.name}」${fmtInt(entry.qty)} 股，該列已標記為已賣出。`,
+    };
+  }
+  state.fieldOverride[acc][row.id] = { ...(state.fieldOverride[acc][row.id] || {}), qty: newQty, avg_price: curAvg };
+  return {
+    ok: true, id: row.id,
+    msg: `已從${ACC_LABEL[acc]}的「${row.name}」扣除 ${fmtInt(entry.qty)} 股：${fmtInt(curQty)} → ${fmtInt(newQty)} 股，`
+      + `平均單價維持 ${curAvg.toFixed(4)}，成本 ${fmtMoney(newQty * curAvg)}。`,
+  };
+}
+
 /* ---------------- add entry form ---------------- */
 function populateAddYearSelect() {
   const sel = document.getElementById('addYear');
@@ -3773,18 +3882,35 @@ document.getElementById('submitEntry').addEventListener('click', async () => {
   const amount = avgCost * qty;
 
   const entry = { date, name, side, avgCost, qty, amount };
+
+  // 先試著併進持股明細。併不進去（賣出的商品不在持股明細、或股數超過庫存）
+  // 就整筆擋下不記錄，讓交易紀錄與持股明細不會從一開始就對不起來。
+  const merged = mergeTxIntoHoldings(acc, entry);
+  if (!merged.ok) {
+    alert(merged.msg);
+    return;
+  }
+  entry.applied = true;          // 標記已併入，日後重掃也不會重複計算
+  entry.appliedTo = merged.id;
+
   if (!state.customTransactions[acc][year]) state.customTransactions[acc][year] = [];
   state.customTransactions[acc][year].push(entry);
   await saveCustomTransactions(acc, year);
+  await saveFieldOverrides(acc);
+  if (merged.sold) await saveSoldOverrides(acc);
+  if (merged.created) await saveConfirmedState(acc);
 
   document.getElementById('addName').value = '';
   document.getElementById('addAvgCost').value = '';
   document.getElementById('addQty').value = '';
-  document.getElementById('addPreview').textContent = '已加入存摺 ✓';
+  document.getElementById('addPreview').textContent = merged.msg;
 
   renderCustomTable();
   renderWeeklyTxSummary();
   renderAccountFinanceAll(); // 可用現金＝帳戶餘額＋當週投資明細，交易變動要連帶更新
+  renderStockTable();        // 庫存數量／平均單價／成本已經變了
+  renderEtfTable();
+  syncOverviewAfterHoldingsChange();
 });
 
 const SIDE_LABEL = { buy: '買進', sell: '賣出' };
@@ -3811,7 +3937,7 @@ function renderCustomTable() {
     <tr>
       <td style="text-align:left">${ACC_LABEL[r.acc]}<span class="tag-custom">手動<\/span><\/td>
       <td style="text-align:left">${r.date}<\/td>
-      <td style="text-align:left">${nameWithCode(r.name)}<\/td>
+      <td style="text-align:left">${nameWithCode(r.name)}${r.applied ? '<span class="tag-merged" title="這筆已併入持股明細的庫存數量與平均單價">已併入<\/span>' : ''}<\/td>
       <td class="${r.side === 'sell' ? 'down' : 'up'}">${SIDE_LABEL[r.side] || r.side}<\/td>
       <td>${r.avgCost != null ? r.avgCost.toFixed(2) : '—'}<\/td>
       <td>${fmtInt(r.qty)}<\/td>
