@@ -404,10 +404,13 @@ tr.row-calc-excluded td:not(:last-child){opacity:0.6;}
 .div-cell-input{width:100%;font-family:'IBM Plex Mono',monospace;font-size:12px;text-align:center;border:1px solid var(--gold);border-radius:4px;padding:2px 4px;background:#fffdf5;}
 .div-val{display:block;}
 .div-edited{color:var(--gold);font-weight:600;}
-/* 配息日期已過、但這筆配息還沒按「匯入」：粗體紅字提醒該匯入了 */
-/* 入帳日已到卻還沒匯入：用 --gain（紅）與分頁按鈕的提示同色。原本是
-   --loss，在這套「漲紅跌綠」的配色裡會顯示成綠字，跟提示的意思相反。 */
-.div-overdue{color:var(--gain)!important;font-weight:700;}
+/* 入帳日已到卻還沒匯入：整格反紅配白字，在 12 個月的格子裡一眼就定位得到。
+   顏色用 --gain，與「03 存股與配息」分頁按鈕的提示同色。
+   標記掛在 <td> 而不是裡面的 <span>，因為金額有可能是空的，只染文字就會看不見。
+   級距色（.div-monthly 等）與 .div-stock-cell 也設 td 背景且權重相同，
+   所以這裡用 !important 蓋過去，不倚賴規則先後順序。 */
+.div-month-cell.div-overdue-cell{background:var(--gain)!important;}
+.div-overdue-cell .div-val{color:#fff!important;font-weight:700;}
 tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--paper-line);}
 .yield-complete{font-weight:700;}
 
@@ -2855,8 +2858,8 @@ function renderEtfTable() {
       const cellCls = isExpected ? tierCls : '';
       const isEdited = (state.divOverride[acc]?.[r.name]?.[m]) !== undefined;
       const isOverdue = isDivOverdue(state.divDetail[acc]?.[r.name]?.[m]);
-      return `<td class="div-month-cell ${cellCls}" data-etf="${r.name}" data-month="${m}">
-        <span class="div-val ${isEdited ? 'div-edited' : ''} ${isOverdue ? 'div-overdue' : ''}">${val ? Math.round(val).toLocaleString('zh-TW') : ''}<\/span>
+      return `<td class="div-month-cell ${cellCls} ${isOverdue ? 'div-overdue-cell' : ''}" data-etf="${r.name}" data-month="${m}">
+        <span class="div-val ${isEdited ? 'div-edited' : ''}">${val ? Math.round(val).toLocaleString('zh-TW') : ''}<\/span>
       <\/td>`;
     }).join('');
 
@@ -2934,8 +2937,8 @@ function renderStockDivTable() {
         const val = effectiveStockDivValue(acc, r.name, m);
         const isEdited = val !== null;
         const isOverdue = isDivOverdue(state.divStockDetail[acc]?.[r.name]?.[m]);
-        return `<td class="div-month-cell div-stock-cell" data-stock="${r.name}" data-month="${m}">
-          <span class="div-val ${isEdited ? 'div-edited' : ''} ${isOverdue ? 'div-overdue' : ''}">${val != null ? Math.round(val).toLocaleString('zh-TW') : ''}<\/span>
+        return `<td class="div-month-cell div-stock-cell ${isOverdue ? 'div-overdue-cell' : ''}" data-stock="${r.name}" data-month="${m}">
+          <span class="div-val ${isEdited ? 'div-edited' : ''}">${val != null ? Math.round(val).toLocaleString('zh-TW') : ''}<\/span>
         <\/td>`;
       }).join('');
       return `<tr>
