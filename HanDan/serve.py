@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import re
 import sys
 import threading
@@ -1017,6 +1018,63 @@ def import_dividend(acc: str, amount: float) -> dict:
     }
 
 
+def adjust_balance(acc: str, delta: float) -> dict:
+    """「存簿資金輸入」：把一筆與股票無關的資金異動（現金利息、提領、手續費
+    等）疊加到帳戶餘額 B2。沿用 _append_delta_to_cell 的附加公式寫法，接一個
+    `+利息` 或 `-提領` 在使用者原本的公式後面，保留逐筆異動的歷史，不把整格
+    覆蓋成算好的數字。
+
+    acc 必須明確是 main 或 keqiang：其他寫入函式把「不是 main」一律當成可橙，
+    這裡碰的是帳戶餘額，打錯帳戶的代價比較高，所以直接拒絕。
+    """
+    if acc not in ("main", "keqiang"):
+        return {"ok": False, "error": f"不明的帳戶：{acc!r}"}
+    if not math.isfinite(delta) or delta == 0:
+        return {"ok": False, "error": "金額必須是不為 0 的數字"}
+
+    xlsx_path = BASE_DIR / XLSX_NAME
+    if not xlsx_path.exists():
+        return {"ok": False, "error": f"找不到 {XLSX_NAME}"}
+
+    try:
+        import openpyxl
+    except ImportError:
+        return {"ok": False, "error": "本機環境缺少 openpyxl 套件，無法寫入 xlsx"}
+
+    year = datetime.now().year
+    sheet_name = f"{year}損益表" if acc == "main" else f"{year}損益表 (可橙)"
+
+    wb_cached, wb_backup_cached, err = _load_balance_workbooks(xlsx_path)
+    if err is not None:
+        return err
+    balance_before, _ = _read_balance_and_pending(wb_cached, wb_backup_cached, sheet_name)
+
+    try:
+        wb = openpyxl.load_workbook(xlsx_path, data_only=False)
+    except PermissionError:
+        return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
+
+    if sheet_name not in wb.sheetnames:
+        return {"ok": False, "error": f"找不到分頁「{sheet_name}」"}
+
+    _append_delta_to_cell(wb[sheet_name]["B2"], delta)
+
+    try:
+        wb.save(xlsx_path)
+    except PermissionError:
+        return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"儲存失敗：{type(exc).__name__}: {exc}"}
+
+    return {
+        "ok": True,
+        "sheet": sheet_name,
+        "newBalance": (balance_before or 0) + delta,
+    }
+
+
 def import_stock_dividend(acc: str, name: str, date_iso: str, ex_div_amount: float,
                            fee: float, this_amount: float) -> dict:
     """股票配息的「匯入」：這是真正動到 xlsx 的動作（「確認」只存網頁本地
@@ -1667,6 +1725,23 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(length) or b"{}")
                 result = adjust_pending_dividend(
+                    acc=body.get("acc"),
+                    delta=float(body.get("delta")),
+                )
+                self._send_json(200, result)
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                self._send_json(500, {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            return
+
+        if path == "/api/adjust-balance":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                result = adjust_balance(
                     acc=body.get("acc"),
                     delta=float(body.get("delta")),
                 )

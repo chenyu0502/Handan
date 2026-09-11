@@ -555,6 +555,10 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
           <div class="seg" id="accSegEtf"></div>
           <div class="seg" id="divTypeSegEtf"></div>
           <button class="btn ghost" id="clearEtfDivBtn" style="display:none;">清空所有 ETF 配息設定</button>
+          <!-- margin-left:auto 把結果訊息與按鈕一起推到最右邊，桌面版按鈕剛好落在
+               「未入帳配息」卡片正上方；訊息為空時寬度是 0，不影響按鈕位置 -->
+          <span class="hint" id="cashAdjustFlash" style="margin-left:auto;align-self:center;"></span>
+          <button class="btn ghost" id="cashAdjustBtn">存簿資金輸入</button>
         </div>
         <div class="grid grid-4" id="accountFinanceEtf" style="margin-bottom:16px;"></div>
         <div class="table-wrap"><table id="etfTable"></table></div>
@@ -1975,6 +1979,125 @@ function startFinanceEdit(span) {
     else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
   });
   input.addEventListener('click', (e) => e.stopPropagation());
+}
+
+// 「存簿資金輸入」：記一筆跟股票買賣、配息都無關的資金異動，例如現金利息
+// （正數）、提領或手續費（負數），按「匯入」直接加總到目前帳戶的帳戶餘額。
+//
+// 透過 serve.py 開啟時，先寫進 菡萏咖啡.xlsx 的 B2（附加成 +金額／-金額，保留
+// 使用者原本逐筆記在公式裡的歷史），成功後才更新網頁端的帳戶餘額。順序刻意
+// 跟配息匯入相反：xlsx 被 Excel 鎖住時兩邊都不動，使用者關掉 Excel 再按一次
+// 就好，不會出現網頁已經加過、重按又加一次的情況。直接開檔案時沒有本機服務，
+// 只更新網頁端並註明沒有同步 xlsx。
+function openCashAdjustModal(anchorBtn) {
+  document.querySelectorAll('.cash-adjust-modal').forEach(m => m.remove());
+  const acc = state.account;
+  const current = effectiveBalance(acc);
+
+  const modal = document.createElement('div');
+  modal.className = 'div-picker cash-adjust-modal';
+  modal.innerHTML = `
+    <div class="div-picker-title">存簿資金輸入（${ACC_LABEL[acc]}）<\/div>
+    <div class="field">
+      <label>金額<\/label>
+      <input type="number" id="cashAdjustAmount" step="any" placeholder="例：125 或 -15">
+    <\/div>
+    <div class="hint" style="margin-top:6px;">正數為加金（例：現金利息），負數為減金（例：提領、手續費）。<\/div>
+    <div class="div-picker-title" id="cashAdjustPreview" style="margin-top:10px;margin-bottom:0;font-size:13.5px;">
+      帳戶餘額 ${current != null ? fmtMoney(current) : '尚未設定'}
+    <\/div>
+    <div class="hint" id="cashAdjustStatus" style="min-height:16px;margin-top:4px;"><\/div>
+    <div class="div-picker-btns">
+      <button class="btn" id="cashAdjustImport" disabled>匯入<\/button>
+      <button class="btn ghost" id="cashAdjustCancel">取消<\/button>
+    <\/div>`;
+
+  const rect = anchorBtn.getBoundingClientRect();
+  modal.style.cssText = `position:fixed;z-index:999;top:${rect.bottom + 6}px;`
+    + `left:${Math.max(8, Math.min(rect.right - 320, window.innerWidth - 340))}px;`;
+  document.body.appendChild(modal);
+
+  const input = modal.querySelector('#cashAdjustAmount');
+  const preview = modal.querySelector('#cashAdjustPreview');
+  const status = modal.querySelector('#cashAdjustStatus');
+  const importBtn = modal.querySelector('#cashAdjustImport');
+  const cancelBtn = modal.querySelector('#cashAdjustCancel');
+
+  const readAmount = () => {
+    const v = parseFloat(input.value);
+    return (Number.isFinite(v) && v !== 0) ? v : null;
+  };
+  const close = () => { modal.remove(); document.removeEventListener('click', onOutside, true); };
+  const onOutside = (e) => { if (!modal.contains(e.target) && e.target !== anchorBtn) close(); };
+
+  input.addEventListener('input', () => {
+    const amt = readAmount();
+    importBtn.disabled = amt == null;
+    status.textContent = '';
+    status.style.color = '';
+    if (amt == null) {
+      preview.textContent = `帳戶餘額 ${current != null ? fmtMoney(current) : '尚未設定'}`;
+      return;
+    }
+    const base = current || 0;
+    preview.innerHTML = `帳戶餘額 ${fmtMoney(base)} → <span class="${pnlClass(amt)}">${fmtMoney(base + amt)}<\/span>`
+      + `<span class="hint" style="margin-left:6px;">（${amt > 0 ? '加金' : '減金'} ${fmtMoney(Math.abs(amt))}）<\/span>`;
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !importBtn.disabled) { e.preventDefault(); importBtn.click(); }
+    else if (e.key === 'Escape') { e.preventDefault(); close(); }
+  });
+  cancelBtn.addEventListener('click', close);
+
+  importBtn.addEventListener('click', async () => {
+    const amt = readAmount();
+    if (amt == null) return;
+    importBtn.disabled = true;
+    cancelBtn.disabled = true;
+    input.disabled = true;
+
+    let xlsxNote = '';
+    if (location.protocol.startsWith('http')) {
+      status.style.color = '';
+      status.textContent = '寫入 Excel 中…';
+      let data = null;
+      try {
+        const res = await fetch('/api/adjust-balance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ acc, delta: amt }),
+        });
+        data = await res.json();
+      } catch (e) {
+        data = { ok: false, error: '無法連上本機服務' };
+      }
+      if (!data || !data.ok) {
+        status.style.color = 'var(--gain)';
+        status.textContent = `匯入失敗，帳戶餘額沒有變動：${(data && data.error) || '未知錯誤'}`;
+        importBtn.disabled = false;
+        cancelBtn.disabled = false;
+        input.disabled = false;
+        return;
+      }
+    } else {
+      xlsxNote = '（直接開檔案，未同步 菡萏咖啡.xlsx）';
+    }
+
+    // 以按下當下的帳戶餘額為準重新計算，不沿用開視窗時讀到的值
+    state.accountFinance[acc].balance = (effectiveBalance(acc) || 0) + amt;
+    await saveAccountFinance(acc);
+    renderAccountFinanceAll();
+    close();
+    const flash = document.getElementById('cashAdjustFlash');
+    if (flash) {
+      flash.textContent = `已${amt > 0 ? '加入' : '扣除'} ${fmtMoney(Math.abs(amt))}，${ACC_LABEL[acc]}帳戶餘額 `
+        + `${fmtMoney(effectiveBalance(acc))}${xlsxNote}`;
+    }
+  });
+
+  // 等這次點擊事件結束後才開始監聽，避免開視窗的那一下點擊立刻把它關掉
+  setTimeout(() => document.addEventListener('click', onOutside, true), 0);
+  input.focus();
 }
 
 function renderStockSummary() {
@@ -4175,6 +4298,14 @@ function renderAll() {
   const confirmBtn = document.getElementById('confirmHoldings');
   if (confirmBtn) {
     confirmBtn.addEventListener('click', confirmHoldingsForAccount);
+  }
+
+  const cashAdjustBtn = document.getElementById('cashAdjustBtn');
+  if (cashAdjustBtn) {
+    // 手機版是唯讀版，寫不回電腦上的 xlsx 與狀態鏡像，在那裡改帳戶餘額只會
+    // 留在手機自己的瀏覽器裡，所以直接不顯示這顆按鈕
+    if (window.__HANDAN_MOBILE__) cashAdjustBtn.style.display = 'none';
+    cashAdjustBtn.addEventListener('click', () => openCashAdjustModal(cashAdjustBtn));
   }
 
   const clearEtfDivBtn = document.getElementById('clearEtfDivBtn');
