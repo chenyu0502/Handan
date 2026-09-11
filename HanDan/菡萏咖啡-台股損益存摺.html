@@ -2016,6 +2016,8 @@ function openCashAdjustModal(anchorBtn) {
   modal.style.cssText = `position:fixed;z-index:999;top:${rect.bottom + 6}px;`
     + `left:${Math.max(8, Math.min(rect.right - 320, window.innerWidth - 340))}px;`;
   document.body.appendChild(modal);
+  // 跟配息登記視窗一樣，抓住標題列可以拖曳移動
+  makeDraggable(modal, modal.querySelector('.div-picker-title'));
 
   const input = modal.querySelector('#cashAdjustAmount');
   const preview = modal.querySelector('#cashAdjustPreview');
@@ -2027,8 +2029,19 @@ function openCashAdjustModal(anchorBtn) {
     const v = parseFloat(input.value);
     return (Number.isFinite(v) && v !== 0) ? v : null;
   };
+  // 拖曳時游標若甩出視窗範圍才放開，瀏覽器接著送出的 click 目標會落在視窗外，
+  // 被當成「點外面」而把視窗關掉。記下 mousedown 是否從視窗內開始，是的話
+  // 那一下 click 不算點外面。capture 階段監聽，才不會被 makeDraggable 的
+  // stopPropagation 擋掉。
+  let downInside = false;
+  modal.addEventListener('mousedown', () => { downInside = true; }, true);
   const close = () => { modal.remove(); document.removeEventListener('click', onOutside, true); };
-  const onOutside = (e) => { if (!modal.contains(e.target) && e.target !== anchorBtn) close(); };
+  const onOutside = (e) => {
+    const startedInside = downInside;
+    downInside = false;
+    if (startedInside || modal.contains(e.target) || e.target === anchorBtn) return;
+    close();
+  };
 
   input.addEventListener('input', () => {
     const amt = readAmount();
