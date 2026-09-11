@@ -374,19 +374,8 @@ tbody tr:hover{background:rgba(201,160,43,0.06);}
   color:var(--ink-soft);font-size:13px;padding:16px;text-align:center;
   border:1px dashed var(--paper-line);border-radius:10px;
 }
-.toggle-label{
-  display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--ink-soft);
-  cursor:pointer;user-select:none;
-}
-.toggle-label input{accent-color:var(--gold);width:15px;height:15px;cursor:pointer;}
-tr.row-sold{opacity:0.55;}
-tr.row-sold td{font-style:italic;}
 tr.row-calc-excluded{background:repeating-linear-gradient(45deg,rgba(194,59,59,0.04),rgba(194,59,59,0.04) 8px,rgba(194,59,59,0.08) 8px,rgba(194,59,59,0.08) 16px);}
 tr.row-calc-excluded td:not(:last-child){opacity:0.6;}
-.btn.ghost.sold-toggle{
-  padding:5px 10px;font-size:11.5px;border-color:var(--ink-soft);color:var(--ink-soft);
-}
-.btn.ghost.sold-toggle:hover{border-color:var(--ink);color:var(--ink);}
 .type-badge{
   font-size:10.5px;font-family:'Noto Sans TC',sans-serif;
   padding:2px 8px;border-radius:999px;font-weight:600;
@@ -530,7 +519,6 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
         <div class="control-row">
           <div class="seg" id="accSegHoldings"></div>
           <div class="seg" id="typeFilterSeg"></div>
-          <label class="toggle-label"><input type="checkbox" id="showSoldToggle"> 顯示已賣出的商品</label>
           <button class="btn" id="fetchPriceBtn" style="margin-left:auto;">取得盤後收盤價</button>
         </div>
         <div class="grid grid-4" id="accountFinanceHoldings" style="margin-bottom:16px;"></div>
@@ -844,7 +832,6 @@ const state = {
   divStockOverride: { main: {}, keqiang: {} }, // {acc: {stockName: {monthKey: amount}}} — for stock divs
   divStockDetail: { main: {}, keqiang: {} }, // {acc: {stockName: {monthKey: {date, exDivAmount, fee, thisAmount}}}} — 股票配息登記視窗的原始明細，供再次點擊查閱
   divTypeFilter: 'etf', // 'etf' | 'stock'
-  showSold: false,
   typeFilter: 'all', // 'all' | 'stock' | 'etf'
   sort: { stock: { key: 'custom', dir: 1 }, etf: { key: 'name', dir: 1 } },
   knownKeys: new Set(), // registry of every storage key we've ever written (backup relies on this)
@@ -2121,7 +2108,10 @@ function renderStockSummary() {
   const heldStock = held.filter(s => s.type === 'stock').length;
   const heldEtf = held.filter(s => s.type === 'etf').length;
   const el = document.getElementById('stockSummary');
-  if (el) el.textContent = `持有中 ${held.length} 檔（股票 ${heldStock}／ETF ${heldEtf}）　·　已賣出 ${sold.length} 檔${state.showSold ? '（目前顯示全部）' : '（未顯示）'}`;
+  // 已賣出的列不顯示，按「確認並存檔」時刪除；還沒確認前在這裡提示筆數，
+  // 讓人知道有東西等著被刪（例如剛在「04 記一筆」賣光的那一檔）
+  if (el) el.textContent = `持有中 ${held.length} 檔（股票 ${heldStock}／ETF ${heldEtf}）`
+    + (sold.length ? `　·　已賣出 ${sold.length} 檔，按「確認並存檔」後刪除` : '');
 }
 
 function renderStockTotals(rows, acc) {
@@ -2152,8 +2142,12 @@ function renderStockTotals(rows, acc) {
 function renderStockTable() {
   flushPendingCellEdit();
   const acc = state.account;
-  const all = (baseStocks(acc)).map(r => effectiveStock(acc, r));
-  let rows = state.showSold ? all : all.filter(r => !effectiveSold(acc, r));
+  // 已賣出的列一律不顯示，也不再保留：下次「確認並存檔」時從基準值刪除
+  // （見 confirmHoldingsForAccount）。賣出一律從「04 記一筆」操作，賣到 0 股
+  // 時由 mergeTxIntoHoldings 標記。
+  let rows = baseStocks(acc)
+    .filter(r => !effectiveSold(acc, r))
+    .map(r => effectiveStock(acc, r));
   if (state.typeFilter !== 'all') rows = rows.filter(r => r.type === state.typeFilter);
   renderStockTotals(rows, acc);
   const { key, dir } = state.sort.stock;
@@ -2179,10 +2173,9 @@ function renderStockTable() {
     return `<td class="editable-cell" data-id="${r.id}" data-field="${field}" data-raw="${value != null ? value : ''}" title="點一下可修改數值">${display}<\/td>`;
   };
   const tbody = `<tbody>${rows.map(r => {
-    const sold = effectiveSold(acc, r);
     const excluded = effectiveCalcExcluded(acc, r);
     return `
-    <tr class="${sold ? 'row-sold' : ''} ${excluded ? 'row-calc-excluded' : ''}">
+    <tr class="${excluded ? 'row-calc-excluded' : ''}">
       <td>${nameWithCode(r.name)}${r.edited ? '<span class="edited-dot" title="已手動修改">●<\/span>' : ''}${excluded ? '<span class="excluded-dot" title="暫停列入計算">⊘<\/span>' : ''}<\/td>
       <td><span class="type-badge type-${r.type}">${TYPE_LABEL[r.type] || r.type}<\/span><\/td>
       ${editCell(r, 'qty', r.qty, null)}
@@ -2193,7 +2186,6 @@ function renderStockTable() {
       <td class="${pnlClass(r.pnl)}">${fmtMoney(r.pnl)}<\/td>
       <td class="${pnlClass(r.perf)}">${fmtPct(r.perf)}<\/td>
       <td>
-        <button class="btn ghost sold-toggle" data-id="${r.id}">${sold ? '設為持有中' : '標記已賣出'}<\/button>
         <button class="btn ghost calc-exclude-toggle" data-id="${r.id}" title="不影響顯示，只是不計入成本／市值／損益合計">${excluded ? '恢復列入計算' : '暫停列入計算'}<\/button>
         ${r.edited ? `<button class="btn ghost reset-fields" data-id="${r.id}" title="還原為原始數值">還原<\/button>` : ''}
       <\/td>
@@ -2202,18 +2194,6 @@ function renderStockTable() {
   document.getElementById('stockTable').innerHTML = thead + tbody;
   bindSortHandlers('stock', renderStockTable);
   bindEditableCells(acc);
-  document.querySelectorAll('.sold-toggle').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const id = btn.dataset.id;
-      const stock = (baseStocks(acc)).find(s => s.id === id);
-      const current = effectiveSold(acc, stock);
-      state.soldOverride[acc][id] = !current;
-      await saveSoldOverrides(acc);
-      renderStockTable();
-      renderStockSummary();
-      syncOverviewAfterHoldingsChange();
-    });
-  });
   document.querySelectorAll('.calc-exclude-toggle').forEach(btn => {
     btn.addEventListener('click', async () => {
       const id = btn.dataset.id;
@@ -2320,7 +2300,13 @@ function startCellEdit(td, acc) {
 async function confirmHoldingsForAccount() {
   const acc = state.account;
   const status = document.getElementById('confirmStatus');
-  const hasEdits = Object.keys(state.fieldOverride[acc]).length > 0 || Object.keys(state.soldOverride[acc]).length > 0;
+  // 已賣出的列不再保留：這次確認時從基準值裡刪掉。基準值裡本來就標著
+  // sold:true 的舊列（這個規則上線前留下的）也算，所以沒有其他修改、只有
+  // 待刪除的已賣出列時，一樣要走完整流程，不能在下面提早 return。
+  const soldToPurge = baseStocks(acc).filter(r => effectiveSold(acc, r));
+  const hasEdits = Object.keys(state.fieldOverride[acc]).length > 0
+    || Object.keys(state.soldOverride[acc]).length > 0
+    || soldToPurge.length > 0;
   if (!hasEdits) {
     if (status) status.textContent = '目前沒有尚未確認的修改，重新下載備份中…';
     exportHoldingsWorkbook();
@@ -2336,12 +2322,20 @@ async function confirmHoldingsForAccount() {
     valueDelta: (state.confirmedDelta[acc]?.valueDelta || 0) + live.valueDelta,
   };
 
-  // 2) bake current effective values into a new baseline, edits cleared
-  const baked = baseStocks(acc).map(r => {
-    const eff = effectiveStock(acc, r);
-    const sold = effectiveSold(acc, r);
-    return { ...eff, sold, edited: false };
-  });
+  // 刪除是不可逆的，而下方原本那份 JSON 備份是烘焙「之後」才下載，已經沒有
+  // 這些列了。所以有東西要刪時，先在這裡另外下載一份刪除前的備份（備份讀的
+  // 是 storage，這時還沒寫入，內容就是刪除前的狀態）。
+  if (soldToPurge.length > 0) {
+    await exportFullBackup('刪除已賣出前');
+  }
+
+  // 2) bake current effective values into a new baseline, edits cleared.
+  //    已賣出的列直接不放進新基準值。這不會影響總覽數字：這一輪的差額已在
+  //    步驟 1 併進 confirmedDelta，而已賣出列在基準值裡本來就不貢獻任何
+  //    成本／市值（computeLiveDelta 對 sold 列兩邊都取 0），留著或刪掉結果相同。
+  const baked = baseStocks(acc)
+    .filter(r => !effectiveSold(acc, r))
+    .map(r => ({ ...effectiveStock(acc, r), sold: false, edited: false }));
   state.confirmedStocks[acc] = baked;
 
   // 3) clear the working overrides -- they're now part of the baseline
@@ -2354,7 +2348,10 @@ async function confirmHoldingsForAccount() {
 
   renderStockTable();
   syncOverviewAfterHoldingsChange();
-  if (status) status.textContent = `已將${ACC_LABEL[acc]}的修改設為新基準（${new Date().toLocaleString('zh-TW')}）。`;
+  if (status) {
+    status.textContent = `已將${ACC_LABEL[acc]}的修改設為新基準（${new Date().toLocaleString('zh-TW')}）。`
+      + (soldToPurge.length ? `　已刪除 ${soldToPurge.length} 筆已賣出紀錄，刪除前的備份已另外下載（檔名含「刪除已賣出前」）。` : '');
+  }
 
   exportHoldingsWorkbook();
   await exportFullBackup();
@@ -2569,7 +2566,11 @@ async function importHoldingsWorkbook(file, statusElId) {
 }
 
 /* ---------------- full JSON backup ---------------- */
-async function exportFullBackup() {
+// label 會附加在檔名後面，用來區分同一天下載的多份備份（例如刪除已賣出
+// 紀錄前那一份）。這個函式也直接被當成按鈕的 click handler，那時第一個參數
+// 是 Event 物件，所以只接受字串。
+async function exportFullBackup(label) {
+  const suffix = (typeof label === 'string' && label) ? `-${label}` : '';
   const status = document.getElementById('backupStatus');
   if (status) status.textContent = '正在準備備份…';
   let keys = new Set(state.knownKeys);
@@ -2605,7 +2606,7 @@ async function exportFullBackup() {
   };
   const jsonText = JSON.stringify(payload, null, 2);
   const stamp = new Date().toISOString().slice(0, 10);
-  const filename = `菡萏咖啡-備份-${stamp}.json`;
+  const filename = `菡萏咖啡-備份-${stamp}${suffix}.json`;
 
   let downloadOk = false;
   try {
@@ -3904,8 +3905,9 @@ function nextStockId(acc) {
 //
 // 買進：股數相加、成本相加，平均單價＝新成本÷新股數。
 // 賣出：採移動平均法，平均單價不動，只減股數（成本＝剩餘股數×平均單價）。
-//       賣到剛好 0 股就把該列標記為「已賣出」，不再寫股數覆寫——這樣該列
-//       在已賣出清單裡仍看得到當時的部位，日後取消勾選也能還原。
+//       賣到剛好 0 股就把該列標記為「已賣出」：持股明細立刻不再顯示，下次按
+//       「確認並存檔」時從基準值刪除（見 confirmHoldingsForAccount）。這是唯一
+//       會把持股列標成已賣出的入口，持股明細已經沒有手動「標記已賣出」按鈕。
 //
 // 數字一律寫進 fieldOverride，跟手動編輯「庫存數量／平均單價」走同一條路徑，
 // 之後按「確認並存檔」會一起烘進基準值。找不到商品又是買進時，先在基準值
@@ -3970,7 +3972,8 @@ function mergeTxIntoHoldings(acc, entry) {
     state.soldOverride[acc][row.id] = true;
     return {
       ok: true, id: row.id, sold: true,
-      msg: `已賣光${ACC_LABEL[acc]}的「${row.name}」${fmtInt(entry.qty)} 股，該列已標記為已賣出。`,
+      msg: `已賣光${ACC_LABEL[acc]}的「${row.name}」${fmtInt(entry.qty)} 股，持股明細不再顯示這一檔，`
+        + '到「02 持股明細」按「確認並存檔」後正式刪除。',
     };
   }
   state.fieldOverride[acc][row.id] = { ...(state.fieldOverride[acc][row.id] || {}), qty: newQty, avg_price: curAvg };
@@ -4278,13 +4281,6 @@ function renderAll() {
   // 載入時先鏡像一次，這樣即使這次沒有任何編輯，「更新手機版」也拿得到
   // 先前累積下來的手動修改。
   scheduleStateMirror();
-  const showSoldToggle = document.getElementById('showSoldToggle');
-  if (showSoldToggle) {
-    showSoldToggle.addEventListener('change', (e) => {
-      state.showSold = e.target.checked;
-      renderStockTable();
-    });
-  }
   const fetchPriceBtn = document.getElementById('fetchPriceBtn');
   // syncXlsx：手動按按鈕才同步寫入菡萏咖啡.xlsx；開啟網頁自動抓價那次不帶。
   const runFetchClosePrice = async (syncXlsx = false) => {
