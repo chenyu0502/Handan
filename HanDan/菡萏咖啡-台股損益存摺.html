@@ -374,13 +374,6 @@ tbody tr:hover{background:rgba(201,160,43,0.06);}
   color:var(--ink-soft);font-size:13px;padding:16px;text-align:center;
   border:1px dashed var(--paper-line);border-radius:10px;
 }
-.toggle-label{
-  display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--ink-soft);
-  cursor:pointer;user-select:none;
-}
-.toggle-label input{accent-color:var(--gold);width:15px;height:15px;cursor:pointer;}
-tr.row-sold{opacity:0.55;}
-tr.row-sold td{font-style:italic;}
 tr.row-calc-excluded{background:repeating-linear-gradient(45deg,rgba(194,59,59,0.04),rgba(194,59,59,0.04) 8px,rgba(194,59,59,0.08) 8px,rgba(194,59,59,0.08) 16px);}
 tr.row-calc-excluded td:not(:last-child){opacity:0.6;}
 .btn.ghost.sold-toggle{
@@ -526,11 +519,10 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
       <!-- ===== PANEL: HOLDINGS ===== -->
       <div class="panel" id="panel-holdings">
         <div class="section-title"><span class="num">3</span>持股明細（2026）</div>
-        <p class="section-desc">現股個股與存股 ETF 合併列示；依原始 Excel 的灰底標記自動排除已賣出的商品。點擊「庫存數量」「平均單價」「現價」欄位可直接修改數值，成本／市值／損益會自動重新計算。</p>
+        <p class="section-desc">現股個股與存股 ETF 合併列示；依原始 Excel 的灰底標記自動排除已賣出的商品，手動標記已賣出的商品也會從清單移除。點擊「庫存數量」「平均單價」「現價」欄位可直接修改數值，成本／市值／損益會自動重新計算。</p>
         <div class="control-row">
           <div class="seg" id="accSegHoldings"></div>
           <div class="seg" id="typeFilterSeg"></div>
-          <label class="toggle-label"><input type="checkbox" id="showSoldToggle"> 顯示已賣出的商品</label>
           <button class="btn" id="fetchPriceBtn" style="margin-left:auto;">取得盤後收盤價</button>
         </div>
         <div class="grid grid-4" id="accountFinanceHoldings" style="margin-bottom:16px;"></div>
@@ -844,7 +836,6 @@ const state = {
   divStockOverride: { main: {}, keqiang: {} }, // {acc: {stockName: {monthKey: amount}}} — for stock divs
   divStockDetail: { main: {}, keqiang: {} }, // {acc: {stockName: {monthKey: {date, exDivAmount, fee, thisAmount}}}} — 股票配息登記視窗的原始明細，供再次點擊查閱
   divTypeFilter: 'etf', // 'etf' | 'stock'
-  showSold: false,
   typeFilter: 'all', // 'all' | 'stock' | 'etf'
   sort: { stock: { key: 'custom', dir: 1 }, etf: { key: 'name', dir: 1 } },
   knownKeys: new Set(), // registry of every storage key we've ever written (backup relies on this)
@@ -2121,7 +2112,7 @@ function renderStockSummary() {
   const heldStock = held.filter(s => s.type === 'stock').length;
   const heldEtf = held.filter(s => s.type === 'etf').length;
   const el = document.getElementById('stockSummary');
-  if (el) el.textContent = `持有中 ${held.length} 檔（股票 ${heldStock}／ETF ${heldEtf}）　·　已賣出 ${sold.length} 檔${state.showSold ? '（目前顯示全部）' : '（未顯示）'}`;
+  if (el) el.textContent = `持有中 ${held.length} 檔（股票 ${heldStock}／ETF ${heldEtf}）　·　已賣出 ${sold.length} 檔（不列入清單）`;
 }
 
 function renderStockTotals(rows, acc) {
@@ -2153,7 +2144,8 @@ function renderStockTable() {
   flushPendingCellEdit();
   const acc = state.account;
   const all = (baseStocks(acc)).map(r => effectiveStock(acc, r));
-  let rows = state.showSold ? all : all.filter(r => !effectiveSold(acc, r));
+  // 已賣出的商品一律不列出：賣掉就不再記錄，清單只留現有部位。
+  let rows = all.filter(r => !effectiveSold(acc, r));
   if (state.typeFilter !== 'all') rows = rows.filter(r => r.type === state.typeFilter);
   renderStockTotals(rows, acc);
   const { key, dir } = state.sort.stock;
@@ -2179,10 +2171,9 @@ function renderStockTable() {
     return `<td class="editable-cell" data-id="${r.id}" data-field="${field}" data-raw="${value != null ? value : ''}" title="點一下可修改數值">${display}<\/td>`;
   };
   const tbody = `<tbody>${rows.map(r => {
-    const sold = effectiveSold(acc, r);
     const excluded = effectiveCalcExcluded(acc, r);
     return `
-    <tr class="${sold ? 'row-sold' : ''} ${excluded ? 'row-calc-excluded' : ''}">
+    <tr class="${excluded ? 'row-calc-excluded' : ''}">
       <td>${nameWithCode(r.name)}${r.edited ? '<span class="edited-dot" title="已手動修改">●<\/span>' : ''}${excluded ? '<span class="excluded-dot" title="暫停列入計算">⊘<\/span>' : ''}<\/td>
       <td><span class="type-badge type-${r.type}">${TYPE_LABEL[r.type] || r.type}<\/span><\/td>
       ${editCell(r, 'qty', r.qty, null)}
@@ -2193,7 +2184,7 @@ function renderStockTable() {
       <td class="${pnlClass(r.pnl)}">${fmtMoney(r.pnl)}<\/td>
       <td class="${pnlClass(r.perf)}">${fmtPct(r.perf)}<\/td>
       <td>
-        <button class="btn ghost sold-toggle" data-id="${r.id}">${sold ? '設為持有中' : '標記已賣出'}<\/button>
+        <button class="btn ghost sold-toggle" data-id="${r.id}" title="標記後這一列會從持股明細移除，不再列入計算">標記已賣出<\/button>
         <button class="btn ghost calc-exclude-toggle" data-id="${r.id}" title="不影響顯示，只是不計入成本／市值／損益合計">${excluded ? '恢復列入計算' : '暫停列入計算'}<\/button>
         ${r.edited ? `<button class="btn ghost reset-fields" data-id="${r.id}" title="還原為原始數值">還原<\/button>` : ''}
       <\/td>
@@ -2206,8 +2197,10 @@ function renderStockTable() {
     btn.addEventListener('click', async () => {
       const id = btn.dataset.id;
       const stock = (baseStocks(acc)).find(s => s.id === id);
-      const current = effectiveSold(acc, stock);
-      state.soldOverride[acc][id] = !current;
+      // 標記後該列直接從清單消失，網頁上沒有反向的入口，所以先確認一次。
+      const ok = confirm(`確定要把「${stock ? stock.name : id}」標記為已賣出嗎？這一列會從持股明細移除，也不再列入成本／市值／損益計算。`);
+      if (!ok) return;
+      state.soldOverride[acc][id] = true;
       await saveSoldOverrides(acc);
       renderStockTable();
       renderStockSummary();
@@ -3904,8 +3897,8 @@ function nextStockId(acc) {
 //
 // 買進：股數相加、成本相加，平均單價＝新成本÷新股數。
 // 賣出：採移動平均法，平均單價不動，只減股數（成本＝剩餘股數×平均單價）。
-//       賣到剛好 0 股就把該列標記為「已賣出」，不再寫股數覆寫——這樣該列
-//       在已賣出清單裡仍看得到當時的部位，日後取消勾選也能還原。
+//       賣到剛好 0 股就把該列標記為「已賣出」，不再寫股數覆寫——該列會
+//       直接從持股明細移除，賣出當時的部位仍留在基準值裡，供 XLSX 匯出查閱。
 //
 // 數字一律寫進 fieldOverride，跟手動編輯「庫存數量／平均單價」走同一條路徑，
 // 之後按「確認並存檔」會一起烘進基準值。找不到商品又是買進時，先在基準值
@@ -3970,7 +3963,7 @@ function mergeTxIntoHoldings(acc, entry) {
     state.soldOverride[acc][row.id] = true;
     return {
       ok: true, id: row.id, sold: true,
-      msg: `已賣光${ACC_LABEL[acc]}的「${row.name}」${fmtInt(entry.qty)} 股，該列已標記為已賣出。`,
+      msg: `已賣光${ACC_LABEL[acc]}的「${row.name}」${fmtInt(entry.qty)} 股，該列已標記為已賣出並從持股明細移除。`,
     };
   }
   state.fieldOverride[acc][row.id] = { ...(state.fieldOverride[acc][row.id] || {}), qty: newQty, avg_price: curAvg };
@@ -4278,13 +4271,6 @@ function renderAll() {
   // 載入時先鏡像一次，這樣即使這次沒有任何編輯，「更新手機版」也拿得到
   // 先前累積下來的手動修改。
   scheduleStateMirror();
-  const showSoldToggle = document.getElementById('showSoldToggle');
-  if (showSoldToggle) {
-    showSoldToggle.addEventListener('change', (e) => {
-      state.showSold = e.target.checked;
-      renderStockTable();
-    });
-  }
   const fetchPriceBtn = document.getElementById('fetchPriceBtn');
   // syncXlsx：手動按按鈕才同步寫入菡萏咖啡.xlsx；開啟網頁自動抓價那次不帶。
   const runFetchClosePrice = async (syncXlsx = false) => {
