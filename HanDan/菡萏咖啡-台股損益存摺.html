@@ -2186,7 +2186,7 @@ function renderStockTable() {
       <td class="${pnlClass(r.pnl)}">${fmtMoney(r.pnl)}<\/td>
       <td class="${pnlClass(r.perf)}">${fmtPct(r.perf)}<\/td>
       <td>
-        <button class="btn ghost calc-exclude-toggle" data-id="${r.id}" title="不影響顯示，只是不計入成本／市值／損益合計">${excluded ? '恢復列入計算' : '暫停列入計算'}<\/button>
+        <button class="btn ghost calc-exclude-toggle" data-id="${r.id}" title="${excluded ? '恢復列入計算：重新計入成本／市值／損益合計' : '暫停列入計算：不影響顯示，只是不計入成本／市值／損益合計'}">${excluded ? '恢復' : '暫停'}<\/button>
         ${r.edited ? `<button class="btn ghost reset-fields" data-id="${r.id}" title="還原為原始數值">還原<\/button>` : ''}
       <\/td>
     <\/tr>`;
