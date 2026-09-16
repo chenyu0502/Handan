@@ -451,7 +451,10 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
 .edited-dot{color:var(--gold);font-size:9px;margin-left:5px;vertical-align:middle;}
 .stock-code{margin-left:6px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ink-soft);font-weight:500;letter-spacing:.02em;}
 .excluded-dot{color:var(--gain);font-size:11px;margin-left:5px;vertical-align:middle;}
-.btn.ghost.reset-fields{margin-left:6px;padding:5px 10px;font-size:11.5px;}
+/* 持股明細每列的小按鈕：「暫停／恢復」與「還原」同尺寸 */
+.btn.ghost.calc-exclude-toggle,
+.btn.ghost.reset-fields{padding:5px 10px;font-size:11.5px;}
+.btn.ghost.reset-fields{margin-left:6px;}
 .confirm-bar{
   margin-top:18px;padding:16px 18px;background:rgba(201,160,43,0.06);
   border:1px solid rgba(201,160,43,0.3);border-radius:12px;
