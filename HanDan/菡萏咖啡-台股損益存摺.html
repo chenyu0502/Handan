@@ -546,10 +546,10 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
           <div class="seg" id="accSegEtf"></div>
           <div class="seg" id="divTypeSegEtf"></div>
           <button class="btn ghost" id="clearEtfDivBtn" style="display:none;">清空所有 ETF 配息設定</button>
-          <!-- margin-left:auto 把結果訊息與按鈕一起推到最右邊，桌面版按鈕剛好落在
-               「未入帳配息」卡片正上方；訊息為空時寬度是 0，不影響按鈕位置 -->
-          <span class="hint" id="cashAdjustFlash" style="margin-left:auto;align-self:center;"></span>
-          <button class="btn ghost" id="cashAdjustBtn">存簿資金輸入</button>
+          <!-- margin-left:auto 推到最右邊，桌面版剛好落在「未入帳配息」卡片正上方。
+               匯入結果不另外顯示訊息：訊息一長就把這顆按鈕擠到下一行，而帳戶餘額
+               卡片本來就會即時更新，已經看得到結果。 -->
+          <button class="btn ghost" id="cashAdjustBtn" style="margin-left:auto;">存簿資金輸入</button>
         </div>
         <div class="grid grid-4" id="accountFinanceEtf" style="margin-bottom:16px;"></div>
         <div class="table-wrap"><table id="etfTable"></table></div>
@@ -2115,21 +2115,27 @@ function openCashAdjustModal(anchorBtn) {
     } else {
       // 備註是寫進 xlsx 的儲存格註解，沒有本機服務時無處可寫，要講清楚
       xlsxNote = note
-        ? '（直接開檔案，未同步 菡萏咖啡.xlsx，備註也沒有留下）'
-        : '（直接開檔案，未同步 菡萏咖啡.xlsx）';
+        ? '網頁端的帳戶餘額已更新，但此頁未透過本機服務開啟，沒有同步 菡萏咖啡.xlsx，備註也沒有留下。'
+        : '網頁端的帳戶餘額已更新，但此頁未透過本機服務開啟，沒有同步 菡萏咖啡.xlsx。';
     }
 
     // 以按下當下的帳戶餘額為準重新計算，不沿用開視窗時讀到的值
     state.accountFinance[acc].balance = (effectiveBalance(acc) || 0) + amt;
     await saveAccountFinance(acc);
     renderAccountFinanceAll();
-    close();
-    const flash = document.getElementById('cashAdjustFlash');
-    if (flash) {
-      flash.textContent = `已${amt > 0 ? '加入' : '扣除'} ${fmtMoney(Math.abs(amt))}`
-        + (note ? `（${note}）` : '')
-        + `，${ACC_LABEL[acc]}帳戶餘額 ${fmtMoney(effectiveBalance(acc))}${xlsxNote}`;
+    // 正常匯入完直接關閉，不另外顯示訊息——帳戶餘額卡片已經更新，訊息只會把
+    // 按鈕擠到下一行。只有沒接到本機服務、資料沒進 Excel 這種需要知道的狀況
+    // 才留著視窗把原因講完。
+    if (xlsxNote) {
+      status.style.color = 'var(--gain)';
+      status.textContent = xlsxNote;
+      importBtn.disabled = false;
+      cancelBtn.disabled = false;
+      input.disabled = false;
+      noteInput.disabled = false;
+      return;
     }
+    close();
   });
 
   // 等這次點擊事件結束後才開始監聽，避免開視窗的那一下點擊立刻把它關掉
