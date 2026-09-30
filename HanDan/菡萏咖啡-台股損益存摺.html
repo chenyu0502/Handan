@@ -2012,6 +2012,10 @@ function openCashAdjustModal(anchorBtn) {
       <input type="number" id="cashAdjustAmount" step="any" placeholder="例：125 或 -15">
     <\/div>
     <div class="hint" style="margin-top:6px;">正數為加金（例：現金利息），負數為減金（例：提領、手續費）。<\/div>
+    <div class="field" style="margin-top:10px;">
+      <label>備註（選填）<\/label>
+      <input type="text" id="cashAdjustNote" maxlength="60" placeholder="例：9 月活存利息、跨行轉帳手續費">
+    <\/div>
     <div class="div-picker-title" id="cashAdjustPreview" style="margin-top:10px;margin-bottom:0;font-size:13.5px;">
       帳戶餘額 ${current != null ? fmtMoney(current) : '尚未設定'}
     <\/div>
@@ -2029,6 +2033,7 @@ function openCashAdjustModal(anchorBtn) {
   makeDraggable(modal, modal.querySelector('.div-picker-title'));
 
   const input = modal.querySelector('#cashAdjustAmount');
+  const noteInput = modal.querySelector('#cashAdjustNote');
   const preview = modal.querySelector('#cashAdjustPreview');
   const status = modal.querySelector('#cashAdjustStatus');
   const importBtn = modal.querySelector('#cashAdjustImport');
@@ -2065,18 +2070,23 @@ function openCashAdjustModal(anchorBtn) {
     preview.innerHTML = `帳戶餘額 ${fmtMoney(base)} → <span class="${pnlClass(amt)}">${fmtMoney(base + amt)}<\/span>`
       + `<span class="hint" style="margin-left:6px;">（${amt > 0 ? '加金' : '減金'} ${fmtMoney(Math.abs(amt))}）<\/span>`;
   });
-  input.addEventListener('keydown', (e) => {
+  // 兩個欄位都吃 Enter 送出、Esc 取消，填完備註不必再把游標移回金額欄
+  const onKey = (e) => {
     if (e.key === 'Enter' && !importBtn.disabled) { e.preventDefault(); importBtn.click(); }
     else if (e.key === 'Escape') { e.preventDefault(); close(); }
-  });
+  };
+  input.addEventListener('keydown', onKey);
+  noteInput.addEventListener('keydown', onKey);
   cancelBtn.addEventListener('click', close);
 
   importBtn.addEventListener('click', async () => {
     const amt = readAmount();
     if (amt == null) return;
+    const note = noteInput.value.trim().replace(/\s+/g, ' ').slice(0, 60);
     importBtn.disabled = true;
     cancelBtn.disabled = true;
     input.disabled = true;
+    noteInput.disabled = true;
 
     let xlsxNote = '';
     if (location.protocol.startsWith('http')) {
@@ -2087,7 +2097,7 @@ function openCashAdjustModal(anchorBtn) {
         const res = await fetch('/api/adjust-balance', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ acc, delta: amt }),
+          body: JSON.stringify({ acc, delta: amt, note }),
         });
         data = await res.json();
       } catch (e) {
@@ -2099,10 +2109,14 @@ function openCashAdjustModal(anchorBtn) {
         importBtn.disabled = false;
         cancelBtn.disabled = false;
         input.disabled = false;
+        noteInput.disabled = false;
         return;
       }
     } else {
-      xlsxNote = '（直接開檔案，未同步 菡萏咖啡.xlsx）';
+      // 備註是寫進 xlsx 的儲存格註解，沒有本機服務時無處可寫，要講清楚
+      xlsxNote = note
+        ? '（直接開檔案，未同步 菡萏咖啡.xlsx，備註也沒有留下）'
+        : '（直接開檔案，未同步 菡萏咖啡.xlsx）';
     }
 
     // 以按下當下的帳戶餘額為準重新計算，不沿用開視窗時讀到的值
@@ -2112,8 +2126,9 @@ function openCashAdjustModal(anchorBtn) {
     close();
     const flash = document.getElementById('cashAdjustFlash');
     if (flash) {
-      flash.textContent = `已${amt > 0 ? '加入' : '扣除'} ${fmtMoney(Math.abs(amt))}，${ACC_LABEL[acc]}帳戶餘額 `
-        + `${fmtMoney(effectiveBalance(acc))}${xlsxNote}`;
+      flash.textContent = `已${amt > 0 ? '加入' : '扣除'} ${fmtMoney(Math.abs(amt))}`
+        + (note ? `（${note}）` : '')
+        + `，${ACC_LABEL[acc]}帳戶餘額 ${fmtMoney(effectiveBalance(acc))}${xlsxNote}`;
     }
   });
 

@@ -1018,11 +1018,27 @@ def import_dividend(acc: str, amount: float) -> dict:
     }
 
 
-def adjust_balance(acc: str, delta: float) -> dict:
+NOTE_MAX_LEN = 60
+
+
+def _clean_note(note) -> str:
+    """備註只留單行純文字：換行與定位字元會讓 Excel 的儲存格註解難讀，
+    過長的內容也會把註解框撐爆，所以壓成一行並截斷。"""
+    if not isinstance(note, str):
+        return ""
+    text = " ".join(note.split())
+    return text[:NOTE_MAX_LEN]
+
+
+def adjust_balance(acc: str, delta: float, note: str = "") -> dict:
     """「存簿資金輸入」：把一筆與股票無關的資金異動（現金利息、提領、手續費
     等）疊加到帳戶餘額 B2。沿用 _append_delta_to_cell 的附加公式寫法，接一個
     `+利息` 或 `-提領` 在使用者原本的公式後面，保留逐筆異動的歷史，不把整格
     覆蓋成算好的數字。
+
+    備註則以「附加一行」的方式寫進 B2 的儲存格註解，跟配息匯入在 L 欄記錄
+    說明的做法一致：公式本身只看得到數字，註解才說得出這筆錢是什麼。原本
+    已有的註解內容保留，新的一行接在後面。
 
     acc 必須明確是 main 或 keqiang：其他寫入函式把「不是 main」一律當成可橙，
     這裡碰的是帳戶餘額，打錯帳戶的代價比較高，所以直接拒絕。
@@ -1031,6 +1047,7 @@ def adjust_balance(acc: str, delta: float) -> dict:
         return {"ok": False, "error": f"不明的帳戶：{acc!r}"}
     if not math.isfinite(delta) or delta == 0:
         return {"ok": False, "error": "金額必須是不為 0 的數字"}
+    note = _clean_note(note)
 
     xlsx_path = BASE_DIR / XLSX_NAME
     if not xlsx_path.exists():
@@ -1059,7 +1076,25 @@ def adjust_balance(acc: str, delta: float) -> dict:
     if sheet_name not in wb.sheetnames:
         return {"ok": False, "error": f"找不到分頁「{sheet_name}」"}
 
-    _append_delta_to_cell(wb[sheet_name]["B2"], delta)
+    balance_cell = wb[sheet_name]["B2"]
+    _append_delta_to_cell(balance_cell, delta)
+
+    # 註解行固定寫上日期與金額，備註留白時也還看得出這筆是什麼時候加減的
+    now = datetime.now()
+    sign = "+" if delta > 0 else "-"
+    comment_line = f"{now.month}/{now.day} {sign}{_fmt_num(abs(delta))}"
+    if note:
+        comment_line += f" {note}"
+    try:
+        from openpyxl.comments import Comment
+        if balance_cell.comment is not None and balance_cell.comment.text:
+            balance_cell.comment.text = balance_cell.comment.text.rstrip("\n") + "\n" + comment_line
+        else:
+            balance_cell.comment = Comment(comment_line, "菡萏咖啡存摺（自動）")
+    except Exception as exc:  # noqa: BLE001
+        # 註解寫不進去不該擋住金額本身，記一筆讓呼叫端顯示即可
+        print(f"[存簿資金輸入] 寫入儲存格註解失敗（{type(exc).__name__}: {exc}）")
+        comment_line = ""
 
     try:
         wb.save(xlsx_path)
@@ -1072,6 +1107,8 @@ def adjust_balance(acc: str, delta: float) -> dict:
         "ok": True,
         "sheet": sheet_name,
         "newBalance": (balance_before or 0) + delta,
+        "note": note,
+        "comment": comment_line,
     }
 
 
@@ -1744,6 +1781,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = adjust_balance(
                     acc=body.get("acc"),
                     delta=float(body.get("delta")),
+                    note=body.get("note") or "",
                 )
                 self._send_json(200, result)
             except Exception as exc:  # noqa: BLE001
