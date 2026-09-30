@@ -442,6 +442,11 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
 }
 .div-picker-month.active{background:var(--div-semi);color:#fff;border-color:var(--div-semi);}
 .div-picker-btns{display:flex;gap:8px;margin-top:12px;align-items:center;}
+.cash-adjust-check{
+  display:flex;align-items:center;gap:6px;margin-top:8px;
+  font-size:12px;color:var(--ink-soft);cursor:pointer;user-select:none;
+}
+.cash-adjust-check input{accent-color:var(--gold);width:14px;height:14px;cursor:pointer;}
 .editable-cell{cursor:pointer;position:relative;}
 .editable-cell:hover{background:rgba(201,160,43,0.12);box-shadow:inset 0 0 0 1px rgba(201,160,43,0.4);}
 .cell-input{
@@ -823,6 +828,7 @@ const state = {
   calcExcluded: { main: {}, keqiang: {} }, // {account: {stockId: true}} — 暫停列入成本/市值/損益計算，但仍顯示在商品列表中（跟已賣出的隱藏邏輯不同）
   fieldOverride: { main: {}, keqiang: {} }, // {account: {stockId: {qty, avg_price, price}}}
   accountFinance: { main: {}, keqiang: {} }, // {account: {balance, cash, pendingDividend}} — 帳戶餘額／可用現金／未入帳配息手動覆寫值
+  capitalFlows: { main: [], keqiang: [] }, // {account: [{date, amount, note}]} — 存入／提領，正為存入；用來同步調整股本基準，見 capitalFlowSince
   accountBalanceBaseline: { main: null, keqiang: null }, // 從 菡萏咖啡.xlsx 對應年度分頁 B2 讀到的基準值，每次連線 serve.py 才會有
   pendingDividendBaseline: { main: null, keqiang: null }, // 從 菡萏咖啡.xlsx 標示「(未入帳)」左邊的值讀到的基準值
   xlsxWeekly: { main: [], keqiang: [] }, // 從 菡萏咖啡.xlsx 當年損益表 A4:I55 讀到的每週記帳（含週績效），每次連線 serve.py 才會有
@@ -869,6 +875,7 @@ function wellKnownKeyCandidates() {
     keys.push(`field-override:${acc}`);
     keys.push(`confirmed-stocks:${acc}`);
     keys.push(`confirmed-delta:${acc}`);
+    keys.push(`capital-flows:${acc}`);
   });
   return keys;
 }
@@ -1021,6 +1028,43 @@ async function saveAccountFinance(acc) {
   } catch (e) {
     console.error('storage set failed', e);
   }
+}
+
+/* ---------------- 資金進出（存入／提領） ---------------- */
+// 存入與提領是「自己的錢搬進搬出」，不是賺賠：它讓即時庫存變動，股本必須
+// 同額跟著動，損益才會維持不變。利息（收入）與手續費（支出）則相反，只動
+// 即時庫存、不動股本，所以本來的算法就是對的。
+//
+// 這裡只記錄資金進出那一類，每筆存 {date, amount, note}，amount 正為存入、
+// 負為提領。
+async function loadCapitalFlows() {
+  for (const acc of ['main', 'keqiang']) {
+    try {
+      const res = await storageGet(`capital-flows:${acc}`, false);
+      if (res && res.value) state.capitalFlows[acc] = JSON.parse(res.value);
+    } catch (e) { /* not set yet */ }
+  }
+}
+
+async function saveCapitalFlows(acc) {
+  const key = `capital-flows:${acc}`;
+  try {
+    await storageSet(key, JSON.stringify(state.capitalFlows[acc] || []), false);
+    await registerBackupKey(key);
+  } catch (e) {
+    console.error('storage set failed', e);
+  }
+}
+
+// 週記帳基準日之後才發生的資金進出淨額。用「晚於基準日」而不是「含當天」：
+// 基準日那天的 xlsx 週記帳已經把當天的股本寫進去了，再加一次會重複扣。
+// 這個條件也讓調整自動退場——使用者下一次在 Excel 補上新的一週（股本已含
+// 這筆進出）之後，基準日往後推，舊的進出就不再被算進來。
+function capitalFlowSince(acc, afterDateISO) {
+  if (!afterDateISO) return 0;
+  return (state.capitalFlows[acc] || [])
+    .filter(f => f.date > afterDateISO)
+    .reduce((s, f) => s + (Number(f.amount) || 0), 0);
 }
 
 // 存股與配息登記確認時，把配息金額加進「未入帳配息」（網頁端，覆寫值優先於
@@ -1395,11 +1439,18 @@ function renderYearlyMetrics() {
   let liveDeltaSinceLastWeek = null; // currentPnl − lastWeek.total_pnl，只用來讓「當年損益」的即時調整維持望遠鏡加總，不受下面 weekPnl 的比較基準影響
   let weekHoldingsSynced = false;
   let weekBaseline = null; // 卡片顯示「較 {date} 上週」用的那一筆
+  // 週記帳基準日之後的存入／提領。這些錢只是搬進搬出，不是賺賠：即時庫存
+  // 已經跟著變了，股本基準必須同額調整，currentPnl 才不會把提領當成虧損。
+  // 調整 cost 一處就夠——當週損益與當年損益都是從 currentPnl 推出來的。
+  let capAdj = 0;
+  let adjustedCost = null;
   if (isLatestWeekly) {
+    capAdj = capitalFlowSince(state.account, lastWeek.date);
     const realtimeInventory = currentHoldingsValue(state.account)
       + (effectiveCash(state.account) || 0)
       + (effectivePendingDividend(state.account) || 0);
-    const cost = lastWeek.cost;
+    const cost = lastWeek.cost != null ? lastWeek.cost + capAdj : null;
+    adjustedCost = cost;
     const currentPnl = cost != null ? realtimeInventory - cost : null;
     if (currentPnl != null) {
       liveDeltaSinceLastWeek = (lastWeek.total_pnl != null) ? currentPnl - lastWeek.total_pnl : currentPnl;
@@ -1420,7 +1471,11 @@ function renderYearlyMetrics() {
       weekPnl = lastWeek.week_pnl;
     }
   }
-  const weekSyncNote = weekHoldingsSynced ? '　·　已同步持股明細的修改' : '';
+  // 股本被資金進出調整過就寫出來，數字對不上時看得出是哪一筆造成的
+  const capNote = capAdj
+    ? `　·　股本已調整 ${capAdj > 0 ? '+' : ''}${fmtMoney(capAdj)}（資金進出）`
+    : '';
+  const weekSyncNote = (weekHoldingsSynced ? '　·　已同步持股明細的修改' : '') + capNote;
   const weekSub = weekBaseline
     ? `較 ${weekBaseline.date} 上週${weekSyncNote}`
     : '';
@@ -1446,14 +1501,15 @@ function renderYearlyMetrics() {
   let yearCost = null;
   if (rawWeekly.length) {
     yearPnl = rawWeekly.reduce((s, r) => s + (r.week_pnl || 0), 0);
-    yearCost = lastWeek.cost;
+    // 績效的分母同樣要用調整後的股本，否則提領後分母偏高、績效被低估
+    yearCost = adjustedCost != null ? adjustedCost : lastWeek.cost;
     if (isLatestWeekly && liveDeltaSinceLastWeek != null) yearPnl += liveDeltaSinceLastWeek;
   }
   const yearPerf = yearCost ? yearPnl / yearCost : null;
   const currentCard = {
     label: `${state.weeklyYear || '—'} 年損益`,
     value: fmtMoney(yearPnl),
-    sub: `績效 ${fmtPct(yearPerf)}${weekHoldingsSynced ? '　·　已同步持股明細的修改' : ''}`,
+    sub: `績效 ${fmtPct(yearPerf)}${weekHoldingsSynced ? '　·　已同步持股明細的修改' : ''}${capNote}`,
     cls: pnlClass(yearPnl != null ? yearPnl : 0),
   };
 
@@ -2011,7 +2067,18 @@ function openCashAdjustModal(anchorBtn) {
       <label>金額<\/label>
       <input type="number" id="cashAdjustAmount" step="any" placeholder="例：125 或 -15">
     <\/div>
-    <div class="hint" style="margin-top:6px;">正數為加金（例：現金利息），負數為減金（例：提領、手續費）。<\/div>
+    <div class="hint" style="margin-top:6px;">正數為加金，負數為減金。<\/div>
+    <div class="field" style="margin-top:10px;">
+      <label>類別<\/label>
+      <select id="cashAdjustKind">
+        <option value="pnl" selected>利息／手續費等（計入損益）<\/option>
+        <option value="capital">存入／提領（不計損益）<\/option>
+      <\/select>
+    <\/div>
+    <div class="hint" id="cashAdjustKindHint" style="margin-top:6px;">利息是收入、手續費是支出，會計入當週與當年損益。<\/div>
+    <label class="cash-adjust-check" id="cashAdjustBackfillRow" style="display:none;">
+      <input type="checkbox" id="cashAdjustBackfill"> 只補登，不改帳戶餘額
+    <\/label>
     <div class="field" style="margin-top:10px;">
       <label>備註（選填）<\/label>
       <input type="text" id="cashAdjustNote" maxlength="60" placeholder="例：9 月活存利息、跨行轉帳手續費">
@@ -2038,6 +2105,25 @@ function openCashAdjustModal(anchorBtn) {
   const status = modal.querySelector('#cashAdjustStatus');
   const importBtn = modal.querySelector('#cashAdjustImport');
   const cancelBtn = modal.querySelector('#cashAdjustCancel');
+  const kindSel = modal.querySelector('#cashAdjustKind');
+  const kindHint = modal.querySelector('#cashAdjustKindHint');
+  const backfillRow = modal.querySelector('#cashAdjustBackfillRow');
+  const backfill = modal.querySelector('#cashAdjustBackfill');
+
+  // 「只補登」只對資金進出有意義：用在錢已經扣過、但還沒讓股本跟著調整的
+  // 情況（例如直接在 Excel 改過餘額，或這個功能上線前就做掉的提領）。
+  const isCapital = () => kindSel.value === 'capital';
+  const syncKind = () => {
+    backfillRow.style.display = isCapital() ? 'flex' : 'none';
+    if (!isCapital()) backfill.checked = false;
+    kindHint.textContent = isCapital()
+      ? '存入／提領只是資金搬進搬出，不是賺賠：股本會同額調整，損益維持不變。'
+      : '利息是收入、手續費是支出，會計入當週與當年損益。';
+    importBtn.textContent = backfill.checked ? '補登' : '匯入';
+  };
+  kindSel.addEventListener('change', syncKind);
+  backfill.addEventListener('change', syncKind);
+  syncKind();
 
   const readAmount = () => {
     const v = parseFloat(input.value);
@@ -2057,7 +2143,7 @@ function openCashAdjustModal(anchorBtn) {
     close();
   };
 
-  input.addEventListener('input', () => {
+  const renderPreview = () => {
     const amt = readAmount();
     importBtn.disabled = amt == null;
     status.textContent = '';
@@ -2066,10 +2152,20 @@ function openCashAdjustModal(anchorBtn) {
       preview.textContent = `帳戶餘額 ${current != null ? fmtMoney(current) : '尚未設定'}`;
       return;
     }
+    if (backfill.checked) {
+      // 只補登：餘額不動，改的是股本基準
+      preview.innerHTML = `帳戶餘額 ${fmtMoney(current || 0)}（不變）`
+        + `<span class="hint" style="margin-left:6px;">股本調整 ${amt > 0 ? '+' : ''}${fmtMoney(amt)}<\/span>`;
+      return;
+    }
     const base = current || 0;
     preview.innerHTML = `帳戶餘額 ${fmtMoney(base)} → <span class="${pnlClass(amt)}">${fmtMoney(base + amt)}<\/span>`
-      + `<span class="hint" style="margin-left:6px;">（${amt > 0 ? '加金' : '減金'} ${fmtMoney(Math.abs(amt))}）<\/span>`;
-  });
+      + `<span class="hint" style="margin-left:6px;">（${amt > 0 ? '加金' : '減金'} ${fmtMoney(Math.abs(amt))}`
+      + `${isCapital() ? '，股本同額調整' : ''}）<\/span>`;
+  };
+  input.addEventListener('input', renderPreview);
+  kindSel.addEventListener('change', renderPreview);
+  backfill.addEventListener('change', renderPreview);
   // 兩個欄位都吃 Enter 送出、Esc 取消，填完備註不必再把游標移回金額欄
   const onKey = (e) => {
     if (e.key === 'Enter' && !importBtn.disabled) { e.preventDefault(); importBtn.click(); }
@@ -2083,10 +2179,23 @@ function openCashAdjustModal(anchorBtn) {
     const amt = readAmount();
     if (amt == null) return;
     const note = noteInput.value.trim().replace(/\s+/g, ' ').slice(0, 60);
+    const capital = isCapital();
+    const backfillOnly = capital && backfill.checked;
     importBtn.disabled = true;
     cancelBtn.disabled = true;
     input.disabled = true;
     noteInput.disabled = true;
+
+    // 只補登：錢早就進出過了，這裡只是把股本該調整的那一段記起來，
+    // 不碰帳戶餘額、也不寫 Excel（Excel 那邊的數字使用者已經自己處理過）。
+    if (backfillOnly) {
+      state.capitalFlows[acc] = [...(state.capitalFlows[acc] || []),
+        { date: todayISO(), amount: amt, note }];
+      await saveCapitalFlows(acc);
+      renderAll();
+      close();
+      return;
+    }
 
     let xlsxNote = '';
     if (location.protocol.startsWith('http')) {
@@ -2122,7 +2231,14 @@ function openCashAdjustModal(anchorBtn) {
     // 以按下當下的帳戶餘額為準重新計算，不沿用開視窗時讀到的值
     state.accountFinance[acc].balance = (effectiveBalance(acc) || 0) + amt;
     await saveAccountFinance(acc);
-    renderAccountFinanceAll();
+    // 資金進出要另外記一筆，好讓股本基準同額調整（見 capitalFlowSince）
+    if (capital) {
+      state.capitalFlows[acc] = [...(state.capitalFlows[acc] || []),
+        { date: todayISO(), amount: amt, note }];
+      await saveCapitalFlows(acc);
+    }
+    // 損益卡片依賴股本與可用現金，兩者都變了，整頁重繪比只更新餘額卡片穩妥
+    renderAll();
     // 正常匯入完直接關閉，不另外顯示訊息——帳戶餘額卡片已經更新，訊息只會把
     // 按鈕擠到下一行。只有沒接到本機服務、資料沒進 Excel 這種需要知道的狀況
     // 才留著視窗把原因講完。
@@ -4297,6 +4413,11 @@ function renderAll() {
     await loadAccountFinance();
   } catch (e) {
     console.error('loadAccountFinance failed:', e);
+  }
+  try {
+    await loadCapitalFlows();
+  } catch (e) {
+    console.error('loadCapitalFlows failed:', e);
   }
   try {
     await loadConfirmedState();
