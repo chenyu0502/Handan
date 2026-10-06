@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git fetch *)",
+      "Bash(grep -n \"平均成本<\\\\\\\\\\\\\\\\/th><th>成交數量\" 菡萏咖啡-台股損益存摺.html)"
+    ]
+  }
+}

@@ -563,7 +563,7 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
       <!-- ===== PANEL: ADD ===== -->
       <div class="panel" id="panel-add">
         <div class="section-title"><span class="num">5</span>新增一筆記帳</div>
-        <p class="section-desc">記錄每一筆買賣交易：帳戶、年度、記帳日期、商品名稱、平均成本、成交數量，價金由系統自動算出（平均成本×成交數量）。本週買進／賣出是同一帳戶、同一記帳日期下所有買／賣交易的價金加總，存在這台裝置上，不會影響原始檔案。</p>
+        <p class="section-desc">記錄每一筆買賣交易：帳戶、年度、記帳日期、商品名稱、平均成本、成交數量、手續費／交易稅（選填）。價金由系統自動算出——買進是「平均成本×成交數量＋費用」（總支出），賣出是「平均成本×成交數量－費用」（淨入帳）。本週買進／賣出是同一帳戶、同一記帳日期下所有買／賣交易的價金加總，存在這台裝置上，不會影響原始檔案。</p>
         <div class="form-card">
           <div class="form-grid">
             <div class="field">
@@ -596,6 +596,10 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
             <div class="field">
               <label>成交數量（股）</label>
               <input type="number" id="addQty" placeholder="例如 1000" step="any">
+            </div>
+            <div class="field">
+              <label>手續費／交易稅</label>
+              <input type="number" id="addFee" placeholder="選填，例如 71" step="any" min="0">
             </div>
           </div>
           <div class="btn-row">
@@ -4133,19 +4137,39 @@ function populateAddYearSelect() {
   sel.innerHTML = years.map(y => `<option value="${y}" ${y===2026?'selected':''}>${y} 年<\/option>`).join('');
 }
 
+// 手續費／交易稅：買進是額外支出（加到價金），賣出是從賣得的錢裡扣掉（從價金減）。
+// 價金代表的是這筆交易實際的現金流金額，可用現金與買進成本都靠它計算，所以
+// 賣出若照加，可用現金會比實際入帳多算兩倍費用。
+function readEntryFee() {
+  const v = parseFloat(document.getElementById('addFee').value);
+  return Number.isFinite(v) ? v : 0;
+}
+
+function entryAmount(side, avgCost, qty, fee) {
+  const gross = avgCost * qty;
+  return side === 'sell' ? gross - fee : gross + fee;
+}
+
 function updateAddPreview() {
   const avgCost = parseFloat(document.getElementById('addAvgCost').value);
   const qty = parseFloat(document.getElementById('addQty').value);
+  const side = document.getElementById('addSide').value;
+  const fee = readEntryFee();
   const preview = document.getElementById('addPreview');
   if (isNaN(avgCost) || isNaN(qty)) {
     preview.textContent = '';
     return;
   }
-  const amount = avgCost * qty;
-  preview.innerHTML = `價金：<b>${fmtMoney(amount)}<\/b>`;
+  const gross = avgCost * qty;
+  const amount = entryAmount(side, avgCost, qty, fee);
+  const feeNote = fee
+    ? `（${fmtMoney(gross)} ${side === 'sell' ? '−' : '＋'} 費用 ${fmtMoney(fee)}）`
+    : '';
+  preview.innerHTML = `價金：<b>${fmtMoney(amount)}<\/b>`
+    + (feeNote ? `<span style="margin-left:6px;">${feeNote}<\/span>` : '');
 }
 
-['addAvgCost','addQty'].forEach(id => {
+['addAvgCost','addQty','addFee','addSide'].forEach(id => {
   document.getElementById(id).addEventListener('input', updateAddPreview);
   document.getElementById(id).addEventListener('change', updateAddPreview);
 });
@@ -4158,14 +4182,19 @@ document.getElementById('submitEntry').addEventListener('click', async () => {
   const side = document.getElementById('addSide').value;
   const avgCost = parseFloat(document.getElementById('addAvgCost').value);
   const qty = parseFloat(document.getElementById('addQty').value);
+  const fee = readEntryFee();
 
   if (!date || !name || isNaN(avgCost) || isNaN(qty) || avgCost <= 0 || qty <= 0) {
     alert('請完整填寫記帳日期、商品名稱、平均成本與成交數量。');
     return;
   }
-  const amount = avgCost * qty;
+  if (fee < 0) {
+    alert('手續費／交易稅不能是負數。');
+    return;
+  }
+  const amount = entryAmount(side, avgCost, qty, fee);
 
-  const entry = { date, name, side, avgCost, qty, amount };
+  const entry = { date, name, side, avgCost, qty, fee, amount };
 
   // 先試著併進持股明細。併不進去（賣出的商品不在持股明細、或股數超過庫存）
   // 就整筆擋下不記錄，讓交易紀錄與持股明細不會從一開始就對不起來。
@@ -4187,6 +4216,7 @@ document.getElementById('submitEntry').addEventListener('click', async () => {
   document.getElementById('addName').value = '';
   document.getElementById('addAvgCost').value = '';
   document.getElementById('addQty').value = '';
+  document.getElementById('addFee').value = '';
   document.getElementById('addPreview').textContent = merged.msg;
 
   renderCustomTable();
@@ -4216,7 +4246,7 @@ function renderCustomTable() {
     wrap.innerHTML = '<table id="customTable"><\/table>';
   }
   const table = document.getElementById('customTable');
-  const thead = `<thead><tr><th style="text-align:left">帳戶<\/th><th style="text-align:left">日期<\/th><th style="text-align:left">商品名稱<\/th><th>買／賣<\/th><th>平均成本<\/th><th>成交數量<\/th><th>價金<\/th><th><\/th><\/tr><\/thead>`;
+  const thead = `<thead><tr><th style="text-align:left">帳戶<\/th><th style="text-align:left">日期<\/th><th style="text-align:left">商品名稱<\/th><th>買／賣<\/th><th>平均成本<\/th><th>成交數量<\/th><th>手續費／交易稅<\/th><th>價金<\/th><th><\/th><\/tr><\/thead>`;
   const tbody = `<tbody>${rows.map(r => `
     <tr>
       <td style="text-align:left">${ACC_LABEL[r.acc]}<span class="tag-custom">手動<\/span><\/td>
@@ -4225,6 +4255,7 @@ function renderCustomTable() {
       <td class="${r.side === 'sell' ? 'down' : 'up'}">${SIDE_LABEL[r.side] || r.side}<\/td>
       <td>${r.avgCost != null ? r.avgCost.toFixed(2) : '—'}<\/td>
       <td>${fmtInt(r.qty)}<\/td>
+      <td>${r.fee ? fmtMoney(r.fee) : '—'}<\/td>
       <td>${fmtMoney(r.amount)}<\/td>
       <td><button class="btn ghost" data-del-acc="${r.acc}" data-del-year="${r.year}" data-del-idx="${r.idx}">刪除<\/button><\/td>
     <\/tr>`).join('')}<\/tbody>`;
