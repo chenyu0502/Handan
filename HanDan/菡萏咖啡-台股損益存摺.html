@@ -3097,8 +3097,17 @@ function renderEtfTable() {
     return;
   }
   const acc = state.account;
+  // ETF 清單來自 PORTFOLIO_DATA.etf 這份靜態資料，不會因為賣光而減少；賣掉的
+  // 那檔若還留在表上，effectiveEtf 又因為找不到持有中的列而退回靜態的舊股數與
+  // 舊價格，數字跟著過期。所以這裡依持股明細過濾：只留還持有的 ETF，跟個股
+  // 配息表（renderStockDivTable）與持股明細的規則一致。
+  const heldEtfNames = new Set((baseStocks(acc) || [])
+    .filter(s => s.type === 'etf' && !effectiveSold(acc, s) && !effectiveCalcExcluded(acc, s))
+    .map(s => s.name));
   // Tag each row as type='etf' so customStockCompare can sort it correctly
-  const rows = (PORTFOLIO_DATA.etf[acc] || []).map(r => ({ ...effectiveEtf(acc, r), type: 'etf' }));
+  const rows = (PORTFOLIO_DATA.etf[acc] || [])
+    .filter(r => heldEtfNames.has(r.name))
+    .map(r => ({ ...effectiveEtf(acc, r), type: 'etf' }));
   const { key, dir } = state.sort.etf;
   if (key === 'name') {
     rows.sort((a, b) => customStockCompare(a, b));
