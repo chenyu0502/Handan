@@ -4530,9 +4530,23 @@ function renderAll() {
   if (clearEtfDivBtn) {
     clearEtfDivBtn.addEventListener('click', async () => {
       const acc = state.account;
-      const ok = confirm(`確定要清空「${ACC_LABEL[acc]}」目前帳戶所有 ETF 配息設定值嗎？此動作無法復原。`);
+      const ok = confirm(`確定要清空「${ACC_LABEL[acc]}」目前帳戶所有 ETF 配息金額嗎？\n\n`
+        + '所有月份會歸零（含 PORTFOLIO_DATA 內建的基準配息），此動作無法復原。');
       if (!ok) return;
-      state.divOverride[acc] = {};
+      // 必須明確寫入 0，不能只把覆寫刪掉：effectiveDivValue 在沒有覆寫時會退回
+      // PORTFOLIO_DATA 內建的基準配息，刪除覆寫等於把內建數字又放回來，看起來
+      // 像沒清掉。寫 0 覆寫才是真的歸零，年底重置才有效果。
+      // 範圍取「內建清單」∪「目前有覆寫的商品」，才不會漏掉任何一邊。
+      const names = new Set([
+        ...(PORTFOLIO_DATA.etf[acc] || []).map(r => r.name),
+        ...Object.keys(state.divOverride[acc] || {}),
+      ]);
+      const zeroed = {};
+      names.forEach(n => {
+        zeroed[n] = {};
+        MONTHS_EN.forEach(m => { zeroed[n][m] = 0; });
+      });
+      state.divOverride[acc] = zeroed;
       await saveDivOverride(acc);
       renderEtfTable();
     });
