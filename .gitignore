@@ -34,3 +34,6 @@ HanDan/firebase-service-account.json
 # 雲端版建置產物與 Vercel 專案連結（由 build_web.py 重新產生）
 HanDan/handan-web/
 **/.vercel
+
+# Claude Code 的本機設定（權限允許清單），屬於這台機器，不進版控
+.claude/settings.local.json
