@@ -365,6 +365,12 @@ tbody tr:hover{background:rgba(201,160,43,0.06);}
   font-size:10px;color:var(--gold);border:1px solid var(--gold);
   border-radius:4px;padding:1px 5px;margin-left:6px;font-family:'IBM Plex Mono',monospace;
 }
+/* 已賣出、但當年度配息紀錄保留到年底的 ETF 列 */
+.tag-soldout{
+  font-size:10px;color:var(--ink-soft);border:1px solid var(--ink-soft);
+  border-radius:4px;padding:1px 5px;margin-left:6px;font-family:'IBM Plex Mono',monospace;
+}
+tr.row-div-soldout td:not(.div-month-cell){opacity:0.5;}
 /* 這筆交易已併進持股明細的庫存數量與平均單價；沒有這個標記的是舊紀錄 */
 .tag-merged{
   font-size:10px;color:var(--div-quarterly);border:1px solid var(--div-quarterly);
@@ -2916,7 +2922,14 @@ function effectiveEtf(acc, r) {
     .filter(s => s.name === r.name && s.type === 'etf' && !effectiveSold(acc, s))
     .map(s => effectiveStock(acc, s));
 
-  let qty = r.qty, price = r.price, avgPrice = null;
+  // 已經賣光（持股明細裡沒有這一檔的持有列）：部位欄位一律歸零或留白，不能
+  // 退回 PORTFOLIO_DATA 的靜態股數與價格——那是賣出前的舊數字，會讓現價、
+  // 損益、ROI 全部顯示成過期值。配息欄位仍照常保留（見 renderEtfTable）。
+  const soldOut = effs.length === 0;
+
+  let qty = soldOut ? 0 : r.qty;
+  let price = soldOut ? null : r.price;
+  let avgPrice = null;
   if (effs.length) {
     qty = effs.reduce((sum, e) => sum + (e.qty || 0), 0);
     const totalCost = effs.reduce((sum, e) => sum + (e.cost || 0), 0);
@@ -2925,16 +2938,20 @@ function effectiveEtf(acc, r) {
     if (priced.length) price = priced[priced.length - 1].price;
   }
 
-  const cost = avgPrice != null && qty != null ? qty * avgPrice : (r.cost || null);
-  const value = qty != null && price != null ? qty * price : (r.value || null);
+  const cost = soldOut ? null
+    : (avgPrice != null && qty != null ? qty * avgPrice : (r.cost || null));
+  const value = soldOut ? null
+    : (qty != null && price != null ? qty * price : (r.value || null));
   // dividend totals from overrides + base data
   const totalDiv = MONTHS_EN.reduce((s, m) => {
     const v = effectiveDivValue(acc, r.name, m);
     return s + (v || 0);
   }, 0);
-  const pnl = value != null && cost != null ? (value - cost + totalDiv) : r.pnl;
-  const roi = (cost && cost > 0 && pnl != null) ? pnl / cost : null;
-  const annualYield = (cost && cost > 0 && totalDiv > 0) ? totalDiv / cost : null;
+  // 賣光後只剩配息是確定收到的錢，資本利得已經在賣出時實現，不在這裡重算
+  const pnl = soldOut ? (totalDiv || null)
+    : (value != null && cost != null ? (value - cost + totalDiv) : r.pnl);
+  const roi = (!soldOut && cost && cost > 0 && pnl != null) ? pnl / cost : null;
+  const annualYield = (!soldOut && cost && cost > 0 && totalDiv > 0) ? totalDiv / cost : null;
 
   // isDivComplete: true when all expected dividend months for the tier have a value
   const tier = detectEtfTier(r.name, acc);
@@ -2942,7 +2959,7 @@ function effectiveEtf(acc, r) {
   const filledCount = [...expected].filter(m => effectiveDivValue(acc, r.name, m)).length;
   const isDivComplete = expected.size > 0 && filledCount >= expected.size;
 
-  return { ...r, qty, price, cost, value, pnl, roi, annualYield, isDivComplete };
+  return { ...r, qty, price, cost, value, pnl, roi, annualYield, isDivComplete, soldOut, totalDiv };
 }
 
 /* state.divSchedule[acc][etfName] = { tier, semiMonths?, annualMonth? }  */
@@ -3097,16 +3114,18 @@ function renderEtfTable() {
     return;
   }
   const acc = state.account;
-  // ETF 清單來自 PORTFOLIO_DATA.etf 這份靜態資料，不會因為賣光而減少；賣掉的
-  // 那檔若還留在表上，effectiveEtf 又因為找不到持有中的列而退回靜態的舊股數與
-  // 舊價格，數字跟著過期。所以這裡依持股明細過濾：只留還持有的 ETF，跟個股
-  // 配息表（renderStockDivTable）與持股明細的規則一致。
+  // ETF 清單來自 PORTFOLIO_DATA.etf 這份靜態資料，不會因為賣光而減少，所以要
+  // 自己依持股明細過濾。但賣掉的那檔若當年度已經領過配息，紀錄要保留到年底，
+  // 否則「當月配息合計」會憑空少掉已經入袋的錢。配息是存在 divOverride／
+  // divDetail 裡、以月份為鍵的當年度資料，使用者跨年時會清空，所以「還有配息
+  // 數字」這個條件本身就等同「保留到年底」。
   const heldEtfNames = new Set((baseStocks(acc) || [])
     .filter(s => s.type === 'etf' && !effectiveSold(acc, s) && !effectiveCalcExcluded(acc, s))
     .map(s => s.name));
+  const hasDivThisYear = name => MONTHS_EN.some(m => effectiveDivValue(acc, name, m));
   // Tag each row as type='etf' so customStockCompare can sort it correctly
   const rows = (PORTFOLIO_DATA.etf[acc] || [])
-    .filter(r => heldEtfNames.has(r.name))
+    .filter(r => heldEtfNames.has(r.name) || hasDivThisYear(r.name))
     .map(r => ({ ...effectiveEtf(acc, r), type: 'etf' }));
   const { key, dir } = state.sort.etf;
   if (key === 'name') {
@@ -3155,8 +3174,8 @@ function renderEtfTable() {
       <\/td>`;
     }).join('');
 
-    return `<tr>
-      <td>${nameWithCode(r.name)}<\/td>
+    return `<tr class="${r.soldOut ? 'row-div-soldout' : ''}">
+      <td>${nameWithCode(r.name)}${r.soldOut ? '<span class="tag-soldout" title="已賣出，保留當年度的配息紀錄">已賣出<\/span>' : ''}<\/td>
       <td><button class="div-type-btn ${badgeCls}" data-etf="${r.name}" data-acc="${acc}">${tierInfo.label}<\/button><\/td>
       <td>${fmtInt(r.qty)}<\/td>
       <td>${r.price != null ? r.price.toFixed(2) : '—'}<\/td>
