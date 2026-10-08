@@ -3377,6 +3377,7 @@ async function openStockDivEntryModal(td, acc) {
       <button class="btn" id="divEntrySave">確認<\/button>
       <button class="btn ghost" id="divEntryCancel">取消<\/button>
       ${detail.date && !detail.imported ? '<button class="btn ghost" id="divEntryImport" disabled>匯入<\/button>' : ''}
+      ${detail.date ? '<button class="btn ghost" id="divEntryDelete" style="margin-left:auto;color:var(--loss);border-color:var(--loss);">刪除<\/button>' : ''}
     <\/div>`;
 
   const rect = td.getBoundingClientRect();
@@ -3392,6 +3393,7 @@ async function openStockDivEntryModal(td, acc) {
   const status = modal.querySelector('#divEntryStatus');
   const saveBtn = modal.querySelector('#divEntrySave');
   const importBtn = modal.querySelector('#divEntryImport');
+  const deleteBtn = modal.querySelector('#divEntryDelete');
   const existingEl = modal.querySelector('#stockDivExisting');
 
   let existingAmount = null;
@@ -3643,6 +3645,96 @@ async function openStockDivEntryModal(td, acc) {
     });
   }
 
+  // 刪除一筆登記錯誤的配息，刪完可以重新登記正確的金額。
+  //
+  // 回沖範圍要看這筆有沒有匯入過，兩種情況動到的地方不一樣：
+  //   還沒匯入：「確認」只把金額加進未入帳配息，所以扣回未入帳配息即可。
+  //   已經匯入：「確認」加進未入帳配息、「匯入」又從未入帳配息移到帳戶餘額，
+  //             未入帳配息一加一減淨值為 0，真正留下的是帳戶餘額 ＋ 除權息
+  //             累計（L 欄）。所以要扣回的是這兩項，不是未入帳配息。
+  // 這樣刪完重新登記再匯入，帳戶餘額才會剛好是正確金額，不會多加一次。
+  if (deleteBtn) {
+    deleteBtn.addEventListener('click', async () => {
+      const wasImported = !!detail.imported;
+      const amt = Number(detail.thisAmount) || 0;
+      const ok = confirm(`確定要刪除「${stockName}」${monthNum}月的配息紀錄嗎？\n\n`
+        + (wasImported
+          ? `這筆已匯入，會一併扣回帳戶餘額 ${fmtMoney(amt)} 與 Excel 的除權息累計。`
+          : `這筆尚未匯入，會一併扣回未入帳配息 ${fmtMoney(amt)}。`)
+        + '\n此動作無法復原。');
+      if (!ok) return;
+      deleteBtn.disabled = true;
+      saveBtn.disabled = true;
+      if (importBtn) importBtn.disabled = true;
+
+      // 1) 清掉網頁端的登記與明細
+      if (state.divStockOverride[acc] && state.divStockOverride[acc][stockName]) {
+        delete state.divStockOverride[acc][stockName][monthKey];
+      }
+      await saveDivStockOverride(acc);
+      if (state.divStockDetail[acc] && state.divStockDetail[acc][stockName]) {
+        delete state.divStockDetail[acc][stockName][monthKey];
+      }
+      await saveDivStockDetail(acc);
+
+      // 2) 網頁端回沖
+      if (wasImported) {
+        state.accountFinance[acc].balance = (effectiveBalance(acc) || 0) - amt;
+        await saveAccountFinance(acc);
+      } else {
+        await adjustPendingDividendLocal(acc, -amt);
+      }
+      renderAccountFinanceAll();
+
+      if (!location.protocol.startsWith('http')) {
+        modal.remove();
+        renderStockDivTable();
+        return;
+      }
+
+      // 3) 同步回沖 xlsx
+      status.style.color = '';
+      status.textContent = '回沖 Excel 中…';
+      const fails = [];
+      const post = async (url, body) => {
+        try {
+          const res = await fetch(url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const data = await res.json();
+          if (!data.ok) fails.push(data.error || '未知錯誤');
+        } catch (e) {
+          fails.push('無法連上本機服務');
+        }
+      };
+      if (wasImported) {
+        // 除權息累計是一個累加後的總額，只能用「設成新值」的方式扣回來
+        if (existingAmount != null) {
+          await post('/api/set-stock-dividend-base',
+            { acc, name: stockName, newValue: Math.max(0, existingAmount - amt) });
+        } else {
+          fails.push('讀不到目前的除權息累計，L 欄未扣回，請手動調整');
+        }
+        await post('/api/adjust-balance',
+          { acc, delta: -amt, note: `刪除配息登記 ${stockName} ${monthNum}月` });
+      } else {
+        await post('/api/adjust-pending-dividend', { acc, delta: -amt });
+      }
+
+      if (fails.length) {
+        status.style.color = 'var(--loss)';
+        status.textContent = `網頁已刪除，但同步 菡萏咖啡.xlsx 時有問題：${fails.join('；')}`;
+        deleteBtn.disabled = false;
+        saveBtn.disabled = false;
+        renderStockDivTable();
+        return;
+      }
+      modal.remove();
+      renderStockDivTable();
+    });
+  }
+
   setTimeout(() => {
     document.addEventListener('click', function onOut(e) {
       if (!modal.contains(e.target) && e.target !== td && !td.contains(e.target)) { modal.remove(); document.removeEventListener('click', onOut); }
@@ -3862,7 +3954,11 @@ function openDivEntryModal(td, acc) {
   // 錢已經算進帳戶餘額了，刪除紀錄不代表要把錢從帳戶餘額裡拿走）。
   if (deleteBtn) {
     deleteBtn.addEventListener('click', async () => {
-      const ok = confirm(`確定要刪除「${etfName}」${monthNum}月的配息紀錄嗎？網頁與 菡萏咖啡.xlsx 裡的資料都會一併清空，此動作無法復原。`);
+      const ok = confirm(`確定要刪除「${etfName}」${monthNum}月的配息紀錄嗎？\n\n`
+        + (detail.imported
+          ? `這筆已匯入，會一併扣回帳戶餘額 ${fmtMoney(detail.amount)}。`
+          : `這筆尚未匯入，會一併扣回未入帳配息 ${fmtMoney(detail.amount)}。`)
+        + '\n網頁與 菡萏咖啡.xlsx 裡的資料都會清空，此動作無法復原。');
       if (!ok) return;
       deleteBtn.disabled = true;
       saveBtn.disabled = true;
@@ -3878,10 +3974,17 @@ function openDivEntryModal(td, acc) {
         delete state.divDetail[acc][etfName][monthKey];
       }
       await saveDivDetail(acc);
-      if (!wasImported) {
+      // 回沖範圍要看有沒有匯入過（跟個股配息視窗的刪除同一套規則）：
+      //   還沒匯入：金額只進了未入帳配息，扣回未入帳配息。
+      //   已經匯入：未入帳配息一加一減淨值為 0，真正留下的是帳戶餘額，扣回餘額。
+      // 不回沖餘額的話，刪掉重新登記再匯入會把同一筆錢加兩次。
+      if (wasImported) {
+        state.accountFinance[acc].balance = (effectiveBalance(acc) || 0) - oldAmount;
+        await saveAccountFinance(acc);
+      } else {
         await adjustPendingDividendLocal(acc, -oldAmount);
-        renderAccountFinanceAll();
       }
+      renderAccountFinanceAll();
 
       if (!location.protocol.startsWith('http')) {
         modal.remove();
@@ -3905,7 +4008,22 @@ function openDivEntryModal(td, acc) {
           saveBtn.disabled = false;
           return;
         }
-        if (!wasImported) {
+        if (wasImported) {
+          // 已匯入的錢留在帳戶餘額（B2），回沖的是那一格
+          const balRes = await fetch('/api/adjust-balance', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ acc, delta: -oldAmount, note: `刪除配息登記 ${etfName} ${monthNum}月` }),
+          });
+          const balData = await balRes.json();
+          if (!balData.ok) {
+            status.style.color = 'var(--loss)';
+            status.textContent = `配息已刪除，但回沖「帳戶餘額」失敗：${balData.error || '未知錯誤'}`;
+            deleteBtn.disabled = false;
+            saveBtn.disabled = false;
+            return;
+          }
+        } else {
           const pendingRes = await fetch('/api/adjust-pending-dividend', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
