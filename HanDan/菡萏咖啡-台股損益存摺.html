@@ -3364,14 +3364,19 @@ async function openStockDivEntryModal(td, acc) {
         <input type="number" id="divEntryExAmount" step="any" value="${prefill.exDivAmount ?? ''}">
       <\/div>
       <div class="field">
+        <label>配息股數<\/label>
+        <input type="number" id="divEntryQty" step="any" value="${prefill.divQty ?? qty}">
+      <\/div>
+      <div class="field">
         <label>手續費<\/label>
         <input type="number" id="divEntryFee" step="any" value="${prefill.fee ?? 0}">
       <\/div>
     <\/div>
-    <div class="hint" style="margin-top:10px;">此次配息金額 ＝ 除息金額 × 持有股數 − 手續費<\/div>
+    <div class="hint" style="margin-top:10px;">此次配息金額 ＝ 除息金額 × 配息股數 − 手續費<\/div>
+    <div class="hint">預設帶入目前持有股數。除息後才買進的零股不參與這次配息，這時要改成除息當下的股數。<\/div>
     <div class="div-picker-title" id="divEntryAmountPreview" style="margin-top:2px;margin-bottom:0;">—<\/div>
     <div class="hint" id="divEntryNewTotal" style="margin-top:2px;"><\/div>
-    ${detail.date ? `<div class="hint" style="margin-top:4px;">${detail.imported ? `此次配息已匯入帳戶餘額 ✓（上次登記：除息${detail.exDivAmount} ${detail.date} 手續費${detail.fee} 金額${fmtMoney(detail.thisAmount)}）` : '此次配息尚未匯入帳戶餘額'}<\/div>` : ''}
+    ${detail.date ? `<div class="hint" style="margin-top:4px;">${detail.imported ? `此次配息已匯入帳戶餘額 ✓（上次登記：除息${detail.exDivAmount} ${detail.date} 股數${fmtInt(detail.divQty ?? qty)} 手續費${detail.fee} 金額${fmtMoney(detail.thisAmount)}）` : '此次配息尚未匯入帳戶餘額'}<\/div>` : ''}
     <div class="hint" id="divEntryStatus" style="min-height:16px;"><\/div>
     <div class="div-picker-btns">
       <button class="btn" id="divEntrySave">確認<\/button>
@@ -3387,6 +3392,7 @@ async function openStockDivEntryModal(td, acc) {
 
   const dateInput = modal.querySelector('#divEntryDate');
   const exAmountInput = modal.querySelector('#divEntryExAmount');
+  const divQtyInput = modal.querySelector('#divEntryQty');
   const feeInput = modal.querySelector('#divEntryFee');
   const preview = modal.querySelector('#divEntryAmountPreview');
   const newTotalEl = modal.querySelector('#divEntryNewTotal');
@@ -3396,20 +3402,28 @@ async function openStockDivEntryModal(td, acc) {
   const deleteBtn = modal.querySelector('#divEntryDelete');
   const existingEl = modal.querySelector('#stockDivExisting');
 
+  // 空白或非數字時退回目前持有股數，避免清空欄位時算出 NaN
+  const readDivQty = () => {
+    const v = parseFloat(divQtyInput.value);
+    return Number.isFinite(v) ? v : qty;
+  };
+
   let existingAmount = null;
 
   const computeAmount = () => {
     const ex = parseFloat(exAmountInput.value);
     const fee = parseFloat(feeInput.value) || 0;
     if (isNaN(ex)) { preview.textContent = '—'; newTotalEl.textContent = ''; return null; }
-    const amount = ex * qty - fee;
+    // 配息股數可編輯：除息後才買進的零股不參與這次配息，用持有股數會多算
+    const divQty = readDivQty();
+    const amount = ex * divQty - fee;
     preview.textContent = fmtMoney(amount);
     if (existingAmount != null) {
       newTotalEl.textContent = `累加後總額：${fmtMoney(existingAmount + amount)}`;
     }
     return amount;
   };
-  [exAmountInput, feeInput].forEach(el => el.addEventListener('input', computeAmount));
+  [exAmountInput, divQtyInput, feeInput].forEach(el => el.addEventListener('input', computeAmount));
 
   // 「原配息金額」旁邊的「更改」按鈕：手動校正累計基準值（不是新增一筆
   // 配息事件），改完立刻更新這個視窗裡的 existingAmount 跟累加預覽。
@@ -3509,7 +3523,8 @@ async function openStockDivEntryModal(td, acc) {
       return;
     }
     saveBtn.disabled = true;
-    const thisAmount = exDivAmount * qty - fee;
+    const divQty = readDivQty();
+    const thisAmount = exDivAmount * divQty - fee;
     const hadUnimportedDetail = detail.date && !detail.imported;
 
     // 此次配息金額算出來是 0，視為「沒有這筆」：網頁端直接清空這格
@@ -3549,7 +3564,7 @@ async function openStockDivEntryModal(td, acc) {
 
     if (!state.divStockDetail[acc]) state.divStockDetail[acc] = {};
     if (!state.divStockDetail[acc][stockName]) state.divStockDetail[acc][stockName] = {};
-    state.divStockDetail[acc][stockName][monthKey] = { date, exDivAmount, fee, thisAmount, imported: false };
+    state.divStockDetail[acc][stockName][monthKey] = { date, exDivAmount, divQty, fee, thisAmount, imported: false };
     await saveDivStockDetail(acc);
 
     // 重新確認一筆還沒匯入的舊紀錄時，先把舊金額扣回來再加新的，避免
@@ -3782,11 +3797,16 @@ function openDivEntryModal(td, acc) {
         <input type="number" id="divEntryExAmount" step="any" value="${detail.exDivAmount ?? ''}">
       <\/div>
       <div class="field">
+        <label>配息股數<\/label>
+        <input type="number" id="divEntryQty" step="any" value="${detail.divQty ?? qty}">
+      <\/div>
+      <div class="field">
         <label>手續費<\/label>
         <input type="number" id="divEntryFee" step="any" value="${detail.fee ?? 0}">
       <\/div>
     <\/div>
-    <div class="hint" style="margin-top:10px;">配息金額 ＝ 除息金額 × 持有股數 − 手續費<\/div>
+    <div class="hint" style="margin-top:10px;">配息金額 ＝ 除息金額 × 配息股數 − 手續費<\/div>
+    <div class="hint">預設帶入目前持有股數。除息後才買進的零股不參與這次配息，這時要改成除息當下的股數。<\/div>
     <div class="div-picker-title" id="divEntryAmountPreview" style="margin-top:2px;margin-bottom:0;">—<\/div>
     ${detail.date ? `<div class="hint" style="margin-top:4px;">${detail.imported ? '已匯入帳戶餘額 ✓' : '尚未匯入帳戶餘額'}<\/div>` : ''}
     <div class="hint" id="divEntryStatus" style="min-height:16px;"><\/div>
@@ -3804,6 +3824,7 @@ function openDivEntryModal(td, acc) {
 
   const dateInput = modal.querySelector('#divEntryDate');
   const exAmountInput = modal.querySelector('#divEntryExAmount');
+  const divQtyInput = modal.querySelector('#divEntryQty');
   const feeInput = modal.querySelector('#divEntryFee');
   const preview = modal.querySelector('#divEntryAmountPreview');
   const status = modal.querySelector('#divEntryStatus');
@@ -3811,16 +3832,23 @@ function openDivEntryModal(td, acc) {
   const importBtn = modal.querySelector('#divEntryImport');
   const deleteBtn = modal.querySelector('#divEntryDelete');
 
+  // 空白或非數字時退回目前持有股數，避免清空欄位時算出 NaN
+  const readDivQty = () => {
+    const v = parseFloat(divQtyInput.value);
+    return Number.isFinite(v) ? v : qty;
+  };
+
   const computeAmount = () => {
     const ex = parseFloat(exAmountInput.value);
     const fee = parseFloat(feeInput.value) || 0;
     if (isNaN(ex)) { preview.textContent = '—'; return null; }
-    const amount = ex * qty - fee;
+    // 配息股數可編輯：除息後才買進的零股不參與這次配息，用持有股數會多算
+    const amount = ex * readDivQty() - fee;
     preview.textContent = fmtMoney(amount);
     return amount;
   };
   computeAmount();
-  [exAmountInput, feeInput].forEach(el => el.addEventListener('input', computeAmount));
+  [exAmountInput, divQtyInput, feeInput].forEach(el => el.addEventListener('input', computeAmount));
 
   saveBtn.addEventListener('click', async () => {
     const date = dateInput.value;
@@ -3832,7 +3860,8 @@ function openDivEntryModal(td, acc) {
       return;
     }
     saveBtn.disabled = true;
-    const amount = exDivAmount * qty - fee;
+    const divQty = readDivQty();
+    const amount = exDivAmount * divQty - fee;
 
     if (!state.divOverride[acc]) state.divOverride[acc] = {};
     if (!state.divOverride[acc][etfName]) state.divOverride[acc][etfName] = {};
@@ -3846,7 +3875,7 @@ function openDivEntryModal(td, acc) {
 
     if (!state.divDetail[acc]) state.divDetail[acc] = {};
     if (!state.divDetail[acc][etfName]) state.divDetail[acc][etfName] = {};
-    state.divDetail[acc][etfName][monthKey] = { date, exDivAmount, fee, amount, imported: false };
+    state.divDetail[acc][etfName][monthKey] = { date, exDivAmount, divQty, fee, amount, imported: false };
     await saveDivDetail(acc);
     await adjustPendingDividendLocal(acc, pendingDelta);
     renderAccountFinanceAll();
