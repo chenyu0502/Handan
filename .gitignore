@@ -13,7 +13,9 @@ HanDan/菡萏咖啡_手操版.xlsx
 HanDan/~$*.xlsx
 
 # Claude Code local-machine settings
-.claude/settings.local.json
+# 樣式含斜線會被錨定在這個 .gitignore 所在的目錄，對不到 HanDan/.claude/，
+# 所以要用 **/ 開頭讓它在任何層級都生效
+**/.claude/settings.local.json
 
 # 抓價時的自動備份（由 fetch_close.py 重新產生）
 HanDan/*.bak
@@ -34,6 +36,3 @@ HanDan/firebase-service-account.json
 # 雲端版建置產物與 Vercel 專案連結（由 build_web.py 重新產生）
 HanDan/handan-web/
 **/.vercel
-
-# Claude Code 的本機設定（權限允許清單），屬於這台機器，不進版控
-.claude/settings.local.json
