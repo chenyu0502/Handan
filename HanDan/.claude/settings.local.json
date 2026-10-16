@@ -3,7 +3,9 @@
     "allow": [
       "Bash(git fetch *)",
       "Bash(grep -n \"平均成本<\\\\\\\\\\\\\\\\/th><th>成交數量\" 菡萏咖啡-台股損益存摺.html)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -)",
+      "Bash(\"D:/ZZ_Chenyu/Claude/HanDan/.venv/Scripts/python.exe\" run_test_server.py)"
     ]
   }
 }

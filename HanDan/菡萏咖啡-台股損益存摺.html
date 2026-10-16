@@ -551,12 +551,14 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
 
       <!-- ===== PANEL: ETF ===== -->
       <div class="panel" id="panel-etf">
-        <div class="section-title"><span class="num">4</span>存股與配息</div>
-        <p class="section-desc">ETF 頁面顯示配息類型、殖利率與 ROI；股票頁面可手動記錄每月實際配息金額。</p>
+        <div class="section-title">
+          <span class="num">4</span>存股與配息
+          <select class="yr-select" id="divYearSelect" style="margin-left:12px;vertical-align:middle;"></select>
+        </div>
+        <p class="section-desc">ETF 頁面顯示配息類型、殖利率與 ROI；股票頁面可手動記錄每月實際配息金額。配息紀錄依年度分開保存，切換上方年度即可查閱該年；沒有紀錄的年度會是空白。</p>
         <div class="control-row">
           <div class="seg" id="accSegEtf"></div>
           <div class="seg" id="divTypeSegEtf"></div>
-          <button class="btn ghost" id="clearEtfDivBtn" style="display:none;">清空所有 ETF 配息設定</button>
           <!-- margin-left:auto 推到最右邊，桌面版剛好落在「未入帳配息」卡片正上方。
                匯入結果不另外顯示訊息：訊息一長就把這顆按鈕擠到下一行，而帳戶餘額
                卡片本來就會即時更新，已經看得到結果。 -->
@@ -846,7 +848,17 @@ const state = {
   confirmedStocks: { main: null, keqiang: null }, // baked-in baseline after "確認並存檔"
   confirmedDelta: { main: { costDelta: 0, valueDelta: 0 }, keqiang: { costDelta: 0, valueDelta: 0 } },
   divSchedule: { main: {}, keqiang: {} }, // {acc: {etfName: {tier, semiMonths?, annualMonth?}}}
-  divOverride: { main: {}, keqiang: {} }, // {acc: {etfName: {monthKey: amount}}}
+  // 配息資料依年度分開保存。下面四個 *All 是完整資料 {acc: {year: {name: {monthKey: ...}}}}，
+  // 不帶 All 的四個則直接「指向」目前選到年度的那一層物件（同一個物件參考，不是複本），
+  // 所以既有讀寫 state.divOverride[acc][name][m] 的程式都不必改，改年度時只要重新指向。
+  // 參考關係靠 bindDivYear() 維持，任何地方都不可以整個指派 state.divOverride[acc] = {...}，
+  // 那會把連結切斷，寫進去的值就存不回該年度。
+  divYear: new Date().getFullYear(),
+  divOverrideAll: { main: {}, keqiang: {} },
+  divDetailAll: { main: {}, keqiang: {} },
+  divStockOverrideAll: { main: {}, keqiang: {} },
+  divStockDetailAll: { main: {}, keqiang: {} },
+  divOverride: { main: {}, keqiang: {} }, // {acc: {etfName: {monthKey: amount}}}（目前年度）
   divDetail: { main: {}, keqiang: {} }, // {acc: {etfName: {monthKey: {date, exDivAmount, fee, amount}}}} — ETF 配息輸入視窗的原始明細，供再次點擊查閱
   divStockOverride: { main: {}, keqiang: {} }, // {acc: {stockName: {monthKey: amount}}} — for stock divs
   divStockDetail: { main: {}, keqiang: {} }, // {acc: {stockName: {monthKey: {date, exDivAmount, fee, thisAmount}}}} — 股票配息登記視窗的原始明細，供再次點擊查閱
@@ -2862,6 +2874,37 @@ const QTR_MONTH_SETS = {
 };
 
 const MONTHS_EN = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+
+// PORTFOLIO_DATA 那份靜態快照（含 etf[].monthly_dividends 的內建配息）屬於哪一年。
+// 取週記帳裡最新的年度；配息加上年度維度之後，內建配息只能套用在這一年，
+// 否則切到其他年度會冒出這一年的數字，不會是空白。
+const DIV_BASE_YEAR = (() => {
+  const years = Object.keys((PORTFOLIO_DATA.weekly && PORTFOLIO_DATA.weekly.main) || {}).map(Number);
+  return years.length ? Math.max(...years) : new Date().getFullYear();
+})();
+
+// 配息年度下拉選單的可選範圍：涵蓋已經有資料的年度，再往前後各留一年，
+// 這樣年底要先登記明年第一筆配息時選得到。
+function divYearOptions() {
+  const years = new Set([DIV_BASE_YEAR, new Date().getFullYear(), state.divYear]);
+  for (const acc of ['main','keqiang']) {
+    for (const all of [state.divOverrideAll, state.divDetailAll,
+                       state.divStockOverrideAll, state.divStockDetailAll]) {
+      const byYear = all[acc] || {};
+      // 只算真的有資料的年度：bindDivYear 會替瀏覽過的年度建立空桶，
+      // 若把空桶也算進來，只是看一下某年就會讓選單範圍永久變寬。
+      Object.keys(byYear).forEach(y => {
+        if (Object.keys(byYear[y] || {}).length) years.add(Number(y));
+      });
+    }
+  }
+  const list = [...years].filter(Number.isFinite);
+  const min = Math.min(...list) - 1;
+  const max = Math.max(...list) + 1;
+  const out = [];
+  for (let y = min; y <= max; y++) out.push(y);
+  return out;
+}
 const MONTHS_LABEL_ABBR = ['1','2','3','4','5','6','7','8','9','10','11','12'];
 
 function detectEtfTier(etfName, acc) {
@@ -2906,6 +2949,8 @@ function tierToCssClass(tier) {
 function effectiveDivValue(acc, etfName, monthKey) {
   const ov = (state.divOverride[acc] || {})[etfName];
   if (ov && ov[monthKey] !== undefined) return ov[monthKey];
+  // 內建的基準配息只屬於 PORTFOLIO_DATA 那一年，其他年度沒有登記就是空白
+  if (state.divYear !== DIV_BASE_YEAR) return null;
   const r = (PORTFOLIO_DATA.etf[acc] || []).find(e => e.name === etfName);
   return (r && r.monthly_dividends && r.monthly_dividends[monthKey]) || null;
 }
@@ -2964,6 +3009,37 @@ function effectiveEtf(acc, r) {
 
 /* state.divSchedule[acc][etfName] = { tier, semiMonths?, annualMonth? }  */
 /* state.divOverride[acc][etfName][monthKey] = amount                      */
+// 配息資料加上年度維度之前，存的是 {商品: {月份: ...}}，那批資料都屬於基準年度。
+// 判斷依據是「最外層的鍵看起來是不是年份」：ETF 名稱本身也可能是四位數字
+// （0050、0056），所以不能只看位數，要再確認數值落在 2000~2100。
+function normalizeDivByYear(obj) {
+  if (!obj || typeof obj !== 'object') return {};
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return {};
+  const allYears = keys.every(k => /^\d{4}$/.test(k) && Number(k) >= 2000 && Number(k) <= 2100);
+  return allYears ? obj : { [DIV_BASE_YEAR]: obj };
+}
+
+// 讓不帶 All 的四個欄位指向所選年度的那一層物件。用同一個物件參考，所以透過
+// state.divOverride[acc][name][m] 寫進去的值會直接反映到 divOverrideAll，存檔
+// 時不必再合併。
+function bindDivYear(year) {
+  state.divYear = Number(year);
+  const pairs = [
+    [state.divOverride, state.divOverrideAll],
+    [state.divDetail, state.divDetailAll],
+    [state.divStockOverride, state.divStockOverrideAll],
+    [state.divStockDetail, state.divStockDetailAll],
+  ];
+  for (const acc of ['main','keqiang']) {
+    for (const [live, all] of pairs) {
+      if (!all[acc]) all[acc] = {};
+      if (!all[acc][state.divYear]) all[acc][state.divYear] = {};
+      live[acc] = all[acc][state.divYear];
+    }
+  }
+}
+
 async function loadDivSchedule() {
   for (const acc of ['main','keqiang']) {
     try {
@@ -2972,11 +3048,11 @@ async function loadDivSchedule() {
     } catch (e) { /* not set */ }
     try {
       const res = await storageGet(`div-override:${acc}`, false);
-      if (res && res.value) state.divOverride[acc] = JSON.parse(res.value);
+      if (res && res.value) state.divOverrideAll[acc] = normalizeDivByYear(JSON.parse(res.value));
     } catch (e) { /* not set */ }
     try {
       const res = await storageGet(`div-detail:${acc}`, false);
-      if (res && res.value) state.divDetail[acc] = JSON.parse(res.value);
+      if (res && res.value) state.divDetailAll[acc] = normalizeDivByYear(JSON.parse(res.value));
     } catch (e) { /* not set */ }
   }
 }
@@ -2992,7 +3068,7 @@ async function saveDivSchedule(acc) {
 async function saveDivOverride(acc) {
   const k = `div-override:${acc}`;
   try {
-    await storageSet(k, JSON.stringify(state.divOverride[acc] || {}), false);
+    await storageSet(k, JSON.stringify(state.divOverrideAll[acc] || {}), false);
     await registerBackupKey(k);
   } catch (e) { console.error('saveDivOverride failed', e); }
 }
@@ -3000,7 +3076,7 @@ async function saveDivOverride(acc) {
 async function saveDivDetail(acc) {
   const k = `div-detail:${acc}`;
   try {
-    await storageSet(k, JSON.stringify(state.divDetail[acc] || {}), false);
+    await storageSet(k, JSON.stringify(state.divDetailAll[acc] || {}), false);
     await registerBackupKey(k);
   } catch (e) { console.error('saveDivDetail failed', e); }
 }
@@ -3008,7 +3084,7 @@ async function saveDivDetail(acc) {
 async function saveDivStockOverride(acc) {
   const k = `div-stock-override:${acc}`;
   try {
-    await storageSet(k, JSON.stringify(state.divStockOverride[acc] || {}), false);
+    await storageSet(k, JSON.stringify(state.divStockOverrideAll[acc] || {}), false);
     await registerBackupKey(k);
   } catch (e) { console.error('saveDivStockOverride failed', e); }
 }
@@ -3016,7 +3092,7 @@ async function saveDivStockOverride(acc) {
 async function saveDivStockDetail(acc) {
   const k = `div-stock-detail:${acc}`;
   try {
-    await storageSet(k, JSON.stringify(state.divStockDetail[acc] || {}), false);
+    await storageSet(k, JSON.stringify(state.divStockDetailAll[acc] || {}), false);
     await registerBackupKey(k);
   } catch (e) { console.error('saveDivStockDetail failed', e); }
 }
@@ -3051,8 +3127,16 @@ function renderDivTypeFilter() {
     });
     el.appendChild(b);
   });
-  const clearBtn = document.getElementById('clearEtfDivBtn');
-  if (clearBtn) clearBtn.style.display = state.divTypeFilter === 'etf' ? '' : 'none';
+}
+
+/* ---------------- 配息年度選單 ---------------- */
+function renderDivYearSelect() {
+  const sel = document.getElementById('divYearSelect');
+  if (!sel) return;
+  const years = divYearOptions();
+  if (!years.includes(state.divYear)) bindDivYear(years[years.length - 1]);
+  sel.innerHTML = years.map(y => `<option value="${y}">${y} 年配息<\/option>`).join('');
+  sel.value = state.divYear;
 }
 
 /* ---------------- 配息待匯入提示 ---------------- */
@@ -3068,16 +3152,21 @@ function isDivOverdue(detail) {
 // 日期已到卻還沒匯入的紀錄，依日期由舊到新排序。分頁按鈕是兩個帳戶共用的，
 // 所以這裡刻意不看 state.account——只看目前帳戶的話，切到另一個帳戶就會把
 // 提示藏起來，等於漏掉該處理的配息。
+// 掃的是 *All（所有年度），不是目前選到的那一年：該匯入的錢不會因為畫面切到
+// 別的年度就不用處理，提示必須照樣亮著。
 function pendingDivImports() {
   const items = [];
   for (const acc of ['main', 'keqiang']) {
-    for (const [store, kind] of [[state.divDetail, 'etf'], [state.divStockDetail, 'stock']]) {
-      const byName = store[acc] || {};
-      for (const name of Object.keys(byName)) {
-        const byMonth = byName[name] || {};
-        for (const m of Object.keys(byMonth)) {
-          if (isDivOverdue(byMonth[m])) {
-            items.push({ acc, name, kind, month: m, date: byMonth[m].date });
+    for (const [store, kind] of [[state.divDetailAll, 'etf'], [state.divStockDetailAll, 'stock']]) {
+      const byYear = store[acc] || {};
+      for (const year of Object.keys(byYear)) {
+        const byName = byYear[year] || {};
+        for (const name of Object.keys(byName)) {
+          const byMonth = byName[name] || {};
+          for (const m of Object.keys(byMonth)) {
+            if (isDivOverdue(byMonth[m])) {
+              items.push({ acc, year, name, kind, month: m, date: byMonth[m].date });
+            }
           }
         }
       }
@@ -3103,7 +3192,7 @@ function renderDivAlert() {
   }
   btn.innerHTML = `${btn.dataset.label}<span class="tab-alert-count">${items.length}<\/span>`;
   btn.title = '配息日期已到、尚未匯入：\n' + items
-    .map(i => `${ACC_LABEL[i.acc]}　${i.name}　${MONTHS_EN.indexOf(i.month) + 1}月　${i.date}`)
+    .map(i => `${ACC_LABEL[i.acc]}　${i.name}　${i.year} 年 ${MONTHS_EN.indexOf(i.month) + 1}月　${i.date}`)
     .join('\n');
 }
 
@@ -3117,8 +3206,9 @@ function renderEtfTable() {
   // ETF 清單來自 PORTFOLIO_DATA.etf 這份靜態資料，不會因為賣光而減少，所以要
   // 自己依持股明細過濾。但賣掉的那檔若當年度已經領過配息，紀錄要保留到年底，
   // 否則「當月配息合計」會憑空少掉已經入袋的錢。配息是存在 divOverride／
-  // divDetail 裡、以月份為鍵的當年度資料，使用者跨年時會清空，所以「還有配息
-  // 數字」這個條件本身就等同「保留到年底」。
+  // divDetail 裡依年度分開保存的資料，effectiveDivValue 只看目前選到的年度，
+  // 所以「這一年還有配息數字」就等同「這一年要保留這一列」；切到沒有紀錄的
+  // 年度時兩個條件都不成立，已賣出的那幾檔自然不會出現。
   const heldEtfNames = new Set((baseStocks(acc) || [])
     .filter(s => s.type === 'etf' && !effectiveSold(acc, s) && !effectiveCalcExcluded(acc, s))
     .map(s => s.name));
@@ -4560,6 +4650,7 @@ function renderAll() {
   safe(renderStockTable, 'stockTable');
   safe(renderAccountFinanceAll, 'accountFinance');
   safe(renderDivTypeFilter, 'divTypeFilter');
+  safe(renderDivYearSelect, 'divYearSelect');
   safe(renderEtfTable, 'etfTable');
   safe(renderDivAlert, 'divAlert'); // 配息表格若渲染失敗，提示仍要照常算出來
   safe(renderWeeklyTxSummary, 'weeklyTxSummaryTable');
@@ -4621,16 +4712,19 @@ function renderAll() {
     for (const acc of ['main', 'keqiang']) {
       try {
         const res = await storageGet(`div-stock-override:${acc}`, false);
-        if (res && res.value) state.divStockOverride[acc] = JSON.parse(res.value);
+        if (res && res.value) state.divStockOverrideAll[acc] = normalizeDivByYear(JSON.parse(res.value));
       } catch (e) { /* not set yet */ }
       try {
         const res = await storageGet(`div-stock-detail:${acc}`, false);
-        if (res && res.value) state.divStockDetail[acc] = JSON.parse(res.value);
+        if (res && res.value) state.divStockDetailAll[acc] = normalizeDivByYear(JSON.parse(res.value));
       } catch (e) { /* not set yet */ }
     }
   } catch (e) {
     console.error('loadDivSchedule failed:', e);
   }
+  // 四份配息資料都讀完才綁定年度：bindDivYear 會把 state.divOverride[acc] 等
+  // 指向所選年度的物件，綁定之後才有東西可以指。
+  bindDivYear(state.divYear);
   try {
     await loadKeyIndex();
   } catch (e) {
@@ -4675,29 +4769,16 @@ function renderAll() {
     cashAdjustBtn.addEventListener('click', () => openCashAdjustModal(cashAdjustBtn));
   }
 
-  const clearEtfDivBtn = document.getElementById('clearEtfDivBtn');
-  if (clearEtfDivBtn) {
-    clearEtfDivBtn.addEventListener('click', async () => {
-      const acc = state.account;
-      const ok = confirm(`確定要清空「${ACC_LABEL[acc]}」目前帳戶所有 ETF 配息金額嗎？\n\n`
-        + '所有月份會歸零（含 PORTFOLIO_DATA 內建的基準配息），此動作無法復原。');
-      if (!ok) return;
-      // 必須明確寫入 0，不能只把覆寫刪掉：effectiveDivValue 在沒有覆寫時會退回
-      // PORTFOLIO_DATA 內建的基準配息，刪除覆寫等於把內建數字又放回來，看起來
-      // 像沒清掉。寫 0 覆寫才是真的歸零，年底重置才有效果。
-      // 範圍取「內建清單」∪「目前有覆寫的商品」，才不會漏掉任何一邊。
-      const names = new Set([
-        ...(PORTFOLIO_DATA.etf[acc] || []).map(r => r.name),
-        ...Object.keys(state.divOverride[acc] || {}),
-      ]);
-      const zeroed = {};
-      names.forEach(n => {
-        zeroed[n] = {};
-        MONTHS_EN.forEach(m => { zeroed[n][m] = 0; });
-      });
-      state.divOverride[acc] = zeroed;
-      await saveDivOverride(acc);
+  // 配息年度選單：切換後重新指向該年度的資料並重繪整個分頁。
+  // 原本這裡還有一顆「清空所有 ETF 配息設定」，是用來年底重置的；配息改成
+  // 依年度分開保存之後，換到新的一年本來就是空白，不需要清空，已移除。
+  const divYearSelect = document.getElementById('divYearSelect');
+  if (divYearSelect) {
+    divYearSelect.addEventListener('change', (e) => {
+      bindDivYear(Number(e.target.value));
+      renderDivYearSelect();
       renderEtfTable();
+      renderDivAlert();
     });
   }
 
