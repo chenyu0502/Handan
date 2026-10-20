@@ -269,6 +269,26 @@ select.yr-select{
 @media(max-width:500px){.grid-4{grid-template-columns:1fr;}}
 .grid-2{grid-template-columns:repeat(2,1fr);}
 @media(max-width:500px){.grid-2{grid-template-columns:1fr;}}
+/* 年度選單與「當年成本」疊成一欄，放在三張卡片左邊，不去佔卡片的橫向空間。 */
+.yr-cost-col{display:flex;flex-direction:column;gap:8px;align-self:flex-start;}
+.cost-base-field{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--ink-soft);}
+/* 手機版：控制列整排獨佔一行（選單與輸入框並排），卡片換到下一行，
+   否則卡片被擠成細長條，金額會被裁掉。 */
+@media(max-width:720px){
+  .yr-cost-col{flex-direction:row;align-items:flex-end;width:100%;}
+  .yr-cost-col .cost-base-field{flex:1;}
+  .yr-cost-col .cost-base-field input{width:100%;}
+}
+.cost-base-field input{
+  width:124px;
+  border:1px solid var(--paper-line);
+  background:#fff;
+  border-radius:10px;
+  padding:7px 10px;
+  font-size:13px;
+  color:var(--ink);
+  font-family:'IBM Plex Mono',monospace;
+}
 /* 單年週績效的三張卡片（今日／當週／當年損益）。桌面版要求最小寬度才不會
    被年度選單擠成細長條；手機版必須解除，否則 520px 會撐出水平捲軸。 */
 .weekly-metric-row{flex:1;min-width:520px;}
@@ -515,7 +535,13 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
           <div class="seg" id="accSegOverview"></div>
         </div>
         <div class="control-row">
-          <select class="yr-select" id="weeklyYearSelect" style="align-self:flex-start;"></select>
+          <div class="yr-cost-col">
+            <select class="yr-select" id="weeklyYearSelect"></select>
+            <label class="cost-base-field">
+              <span>當年成本</span>
+              <input type="number" step="1" min="0" id="yearCostBaseInput" placeholder="年初庫存">
+            </label>
+          </div>
           <div class="grid grid-3 weekly-metric-row" id="weeklyCurrentMetric"></div>
         </div>
         <div class="chart-box"><canvas id="weeklyChart"></canvas></div>
@@ -841,6 +867,7 @@ const state = {
   fieldOverride: { main: {}, keqiang: {} }, // {account: {stockId: {qty, avg_price, price}}}
   accountFinance: { main: {}, keqiang: {} }, // {account: {balance, cash, pendingDividend}} — 帳戶餘額／可用現金／未入帳配息手動覆寫值
   capitalFlows: { main: [], keqiang: [] }, // {account: [{date, amount, note}]} — 存入／提領，正為存入；用來同步調整股本基準，見 capitalFlowSince
+  yearCostBase: { main: {}, keqiang: {} }, // {account: {year: number}} — 使用者自填的「當年成本（年初庫存）」，當年績效的分母，見 yearCostBaseOf
   accountBalanceBaseline: { main: null, keqiang: null }, // 從 菡萏咖啡.xlsx 對應年度分頁 B2 讀到的基準值，每次連線 serve.py 才會有
   pendingDividendBaseline: { main: null, keqiang: null }, // 從 菡萏咖啡.xlsx 標示「(未入帳)」左邊的值讀到的基準值
   xlsxWeekly: { main: [], keqiang: [] }, // 從 菡萏咖啡.xlsx 當年損益表 A4:I55 讀到的每週記帳（含週績效），每次連線 serve.py 才會有
@@ -898,6 +925,7 @@ function wellKnownKeyCandidates() {
     keys.push(`confirmed-stocks:${acc}`);
     keys.push(`confirmed-delta:${acc}`);
     keys.push(`capital-flows:${acc}`);
+    keys.push(`year-cost-base:${acc}`);
   });
   return keys;
 }
@@ -1076,6 +1104,53 @@ async function saveCapitalFlows(acc) {
   } catch (e) {
     console.error('storage set failed', e);
   }
+}
+
+/* ---------------- 當年成本（當年績效的分母） ---------------- */
+// 「當年績效 = 當年損益 ÷ 當年成本」。這個成本是每年年初定下來的基礎
+// （年初庫存），由使用者自己在「01 總覽與趨勢」填，不從週記帳的股本推算
+// ——兩者不一定相同（2026 我的戶頭週記帳股本是 2,780,000，實際的年初成本
+// 基礎是 2,880,000）。某個年度沒填時才退回用週記帳那一列的股本，維持舊行為。
+//
+// 注意分子不受影響：資金進出（存入／提領）仍然照 capitalFlowSince 調整
+// 損益基準，否則提領會被當成虧損；這裡改的只有分母。
+const YEAR_COST_BASE_SEED = {
+  main: { 2026: 2880000 },
+  keqiang: { 2026: 4122506 },
+};
+
+async function loadYearCostBase() {
+  for (const acc of ['main', 'keqiang']) {
+    let stored = null;
+    try {
+      const res = await storageGet(`year-cost-base:${acc}`, false);
+      if (res && res.value) stored = JSON.parse(res.value);
+    } catch (e) { /* not set yet */ }
+    if (stored && typeof stored === 'object') {
+      state.yearCostBase[acc] = stored;
+    } else {
+      // 第一次用到這個功能：先把已知的年初成本寫進去，之後一律以畫面上
+      // 填的值為準（清空＝這個年度退回用週記帳的股本）。
+      state.yearCostBase[acc] = { ...(YEAR_COST_BASE_SEED[acc] || {}) };
+      await saveYearCostBase(acc);
+    }
+  }
+}
+
+async function saveYearCostBase(acc) {
+  const key = `year-cost-base:${acc}`;
+  try {
+    await storageSet(key, JSON.stringify(state.yearCostBase[acc] || {}), false);
+    await registerBackupKey(key);
+  } catch (e) {
+    console.error('storage set failed', e);
+  }
+}
+
+function yearCostBaseOf(acc, year) {
+  const v = (state.yearCostBase[acc] || {})[String(year)];
+  const n = Number(v);
+  return (v != null && v !== '' && isFinite(n) && n > 0) ? n : null;
 }
 
 // 週記帳基準日之後才發生的資金進出淨額。用「晚於基準日」而不是「含當天」：
@@ -1516,15 +1591,19 @@ function renderYearlyMetrics() {
   //              用 liveDeltaSinceLastWeek 做調整才不會把這段重複計算，
   //              望遠鏡式加總後數學上等價於「加總到今天為止」），讓當年
   //              損益也反映到今天為止，不是只算到上一筆記錄。
-  //   當年績效 = 當年損益 ÷ 總成本（沿用該年度週記帳的股本基準值，
-  //              例如我的帳戶總成本 = 2,780,000）。
+  //   當年績效 = 當年損益 ÷ 當年成本（年初庫存），分母取使用者在年度選單
+  //              下方自填的值（見 yearCostBaseOf）；該年度沒填才退回用週記帳
+  //              那一列的股本。分母不隨資金進出調整——它是年初定下來的成本
+  //              基礎，年中存提款不該改變衡量基準。
   // 取代原本用 PORTFOLIO_DATA.overall 靜態年度彙總（以去年底庫存為分母）的算法。
   let yearPnl = null;
   let yearCost = null;
   if (rawWeekly.length) {
     yearPnl = rawWeekly.reduce((s, r) => s + (r.week_pnl || 0), 0);
-    // 績效的分母同樣要用調整後的股本，否則提領後分母偏高、績效被低估
-    yearCost = adjustedCost != null ? adjustedCost : lastWeek.cost;
+    // 分母優先用自填的「當年成本」；沒填的年度才退回週記帳的股本（此時仍用
+    // 調整後的值，否則提領後分母偏高、績效被低估）。
+    yearCost = yearCostBaseOf(state.account, state.weeklyYear);
+    if (yearCost == null) yearCost = adjustedCost != null ? adjustedCost : lastWeek.cost;
     if (isLatestWeekly && liveDeltaSinceLastWeek != null) yearPnl += liveDeltaSinceLastWeek;
   }
   const yearPerf = yearCost ? yearPnl / yearCost : null;
@@ -1647,6 +1726,22 @@ function renderWeeklyYearSelect() {
   sel.value = state.weeklyYear;
 }
 
+// 「當年成本」輸入框跟著目前的帳戶與年度切換。沒填的年度留白，並把實際
+// 退回使用的股本放進 placeholder，讓人看得出績效分母現在用的是哪個數字。
+function renderYearCostBaseInput() {
+  const input = document.getElementById('yearCostBaseInput');
+  if (!input) return;
+  const v = yearCostBaseOf(state.account, state.weeklyYear);
+  input.value = v != null ? v : '';
+  if (v == null) {
+    const rows = combinedWeekly(state.account, state.weeklyYear).filter(r => !r.placeholder);
+    const fallback = rows.length ? rows[rows.length - 1].cost : null;
+    input.placeholder = fallback ? `股本 ${Math.round(fallback)}` : '年初庫存';
+  } else {
+    input.placeholder = '年初庫存';
+  }
+}
+
 function renderWeeklyChart() {
   if (!chartsAvailable()) return;
   const real = syncedWeekly(state.account, state.weeklyYear);
@@ -1750,7 +1845,27 @@ function renderWeeklyChart() {
 
 document.getElementById('weeklyYearSelect').addEventListener('change', (e) => {
   state.weeklyYear = Number(e.target.value);
+  renderYearCostBaseInput();
   renderWeeklyChart();
+  renderYearlyMetrics();
+});
+
+// 當年成本改了就立刻存檔並重算績效。清空代表「這個年度不自訂」，刪掉該筆
+// 退回用週記帳的股本，不是存成 0。
+document.getElementById('yearCostBaseInput').addEventListener('change', async (e) => {
+  const acc = state.account;
+  const year = String(state.weeklyYear);
+  const raw = String(e.target.value).trim();
+  if (!state.yearCostBase[acc]) state.yearCostBase[acc] = {};
+  if (raw === '') {
+    delete state.yearCostBase[acc][year];
+  } else {
+    const n = Number(raw);
+    if (!isFinite(n) || n <= 0) { renderYearCostBaseInput(); return; } // 打錯字就還原，不要把分母變成 0
+    state.yearCostBase[acc][year] = n;
+  }
+  await saveYearCostBase(acc);
+  renderYearCostBaseInput();
   renderYearlyMetrics();
 });
 
@@ -4644,6 +4759,7 @@ function renderAll() {
   // state.weeklyYear 改成最新年度，而「今日／當週／年損益」三張卡片都依賴
   // 這個值。順序顛倒的話，xlsx 週記帳新增年度後的第一次重繪會用到舊年份。
   safe(renderWeeklyYearSelect, 'weeklyYearSelect');
+  safe(renderYearCostBaseInput, 'yearCostBaseInput');
   safe(renderYearlyMetrics, 'yearlyMetrics');
   safe(renderYearlyChart, 'yearlyChart');
   safe(renderWeeklyChart, 'weeklyChart');
@@ -4700,6 +4816,11 @@ function renderAll() {
     await loadCapitalFlows();
   } catch (e) {
     console.error('loadCapitalFlows failed:', e);
+  }
+  try {
+    await loadYearCostBase();
+  } catch (e) {
+    console.error('loadYearCostBase failed:', e);
   }
   try {
     await loadConfirmedState();

@@ -52,6 +52,11 @@ CODE_MAP_BLOCK = re.compile(r"const STOCK_CODE_MAP = \{.*?\n\};", re.S)
 # 這份備援永遠用不到，直接清空。
 EMBEDDED_PRICES_BLOCK = re.compile(r"const EMBEDDED_PRICES = \{.*?\n\};", re.S)
 
+# 「當年成本」的初次填入值（兩個戶頭的年初庫存金額），只在本機第一次使用
+# 這個功能時寫進瀏覽器儲存。雲端版的值會跟著快照一起從 Firestore 進來，
+# 用不到這份，但它是明文金額，留著等於把兩戶的本金公開，所以一併清空。
+YEAR_COST_SEED_BLOCK = re.compile(r"const YEAR_COST_BASE_SEED = \{.*?\n\};", re.S)
+
 # Firebase 的 web 設定值會打包進前端，這本來就是公開資訊；真正的存取控制
 # 在 Firestore 安全規則（只允許指定 uid 讀取、且一律禁止前端寫入）。
 FIREBASE_CONFIG = """{
@@ -310,7 +315,7 @@ def main() -> int:
     html = must_replace(html, CHART_CDN, f"<script>\n{read_vendor('chart.umd.min.js')}\n</script>", "Chart.js CDN")
     html = must_replace(html, XLSX_CDN, f"<script>\n{read_vendor('xlsx.core.min.js')}\n</script>", "SheetJS CDN")
 
-    # 2. 拿掉所有會洩漏投資組合的資料。這三段都是未登入就看得到的明文，
+    # 2. 拿掉所有會洩漏投資組合的資料。這幾段都是未登入就看得到的明文，
     #    缺一不可，因此任何一段沒命中都直接中止，不容許只做一半就部署。
     html, n = PORTFOLIO_BLOCK.subn("", html, count=1)
     if n != 1:
@@ -324,6 +329,11 @@ def main() -> int:
     html, n = EMBEDDED_PRICES_BLOCK.subn("const EMBEDDED_PRICES = {};", html, count=1)
     if n != 1:
         raise SystemExit("[錯誤] 找不到 EMBEDDED_PRICES 區塊，無法確保資料不外洩，轉換中止。")
+
+    html, n = YEAR_COST_SEED_BLOCK.subn(
+        "const YEAR_COST_BASE_SEED = { main: {}, keqiang: {} };", html, count=1)
+    if n != 1:
+        raise SystemExit("[錯誤] 找不到 YEAR_COST_BASE_SEED 區塊，無法確保資料不外洩，轉換中止。")
 
     # 3. 讓 App 的 script 不要自動執行。type 用瀏覽器不認得的值，內容會被
     #    當成純文字保留，等登入完成後再取出來動態插入。
