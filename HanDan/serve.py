@@ -1303,6 +1303,145 @@ def read_xlsx_weekly() -> dict:
     return {"ok": True, "year": year, "weekly": weekly}
 
 
+# 「總績效」分頁的版面：兩個帳戶各佔一組橫列，年度由左至右排在 C~L 欄。
+#   cash       — 當年的現金加碼／提領（我的戶頭第 1 列、可橙第 7 列）
+#   year       — 年度
+#   inventory  — 年初庫存（＝前一年的當年結算 ＋ 當年的現金調整）
+#   settlement — 當年結算（＝該年度損益表的 C55，最後一週的即時庫存）
+OVERALL_SHEET = "總績效"
+OVERALL_LAYOUT = {
+    "main": {"cash": 1, "year": 2, "inventory": 3, "settlement": 4},
+    "keqiang": {"cash": 7, "year": 8, "inventory": 9, "settlement": 10},
+}
+OVERALL_FIRST_COL = 3   # C
+OVERALL_LAST_COL = 12   # L
+
+
+def read_xlsx_overall() -> dict:
+    """讀「菡萏咖啡.xlsx」的「總績效」分頁，取得歷年的年初庫存與當年結算。
+
+    網頁原本用 PORTFOLIO_DATA.overall 這份靜態快照算歷年績效，它的年初庫存
+    就是前一年的結算值，**沒有**把當年的現金加碼／提領算進去。Excel 這張表
+    有：年初庫存 = 前一年結算 + 當年現金調整（我的戶頭第 1 列、可橙第 7 列）。
+    可橙 2026 的調整是 -1,460,000，少了這一層，分母會高估、績效被低估。
+
+    公式快取被 openpyxl 寫入清空時（見 CLAUDE.md 已知副作用）的補救順序跟
+    read_xlsx_weekly 一致：主檔快取 → BACKUP_XLSX_NAME 快取 → 自己推算
+    （前一年結算 + 現金調整，現金調整那格是純算式，可以安全解析）。全部都
+    讀不到的年度直接略過，不硬湊數字。
+    """
+    xlsx_path = BASE_DIR / XLSX_NAME
+    if not xlsx_path.exists():
+        return {"ok": False, "error": f"找不到 {XLSX_NAME}"}
+
+    try:
+        import openpyxl
+    except ImportError:
+        return {"ok": False, "error": "本機環境缺少 openpyxl 套件"}
+
+    try:
+        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    except PermissionError:
+        return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，暫時無法讀取"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
+
+    if OVERALL_SHEET not in wb.sheetnames:
+        return {"ok": False, "error": f"找不到分頁「{OVERALL_SHEET}」"}
+
+    ws = wb[OVERALL_SHEET]
+    try:
+        ws_raw = openpyxl.load_workbook(xlsx_path, data_only=False)[OVERALL_SHEET]
+    except Exception:  # noqa: BLE001
+        ws_raw = None
+
+    # 備份檔有 1 MB 以上，載入就要 0.4 秒，而且只有在主檔的公式快取被清空時
+    # 才用得到，所以延後到真的讀不到值時才載。
+    _backup: list = []
+
+    def backup_sheet():
+        if not _backup:
+            sheet = None
+            try:
+                path = BASE_DIR / BACKUP_XLSX_NAME
+                if path.exists():
+                    book = openpyxl.load_workbook(path, data_only=True)
+                    if OVERALL_SHEET in book.sheetnames:
+                        sheet = book[OVERALL_SHEET]
+            except Exception:  # noqa: BLE001
+                sheet = None
+            _backup.append(sheet)
+        return _backup[0]
+
+    def num(row: int, col: int):
+        """主檔快取 → 備份檔快取 → 解析公式本身（純算式才解得出來）。
+
+        中間那一步前面先看一眼公式版的同一格：真的空白就直接回 None，不必
+        為了空格去載備份檔。這張表預留到 2030 年、現金調整那一列也多半是
+        空的，少了這道判斷等於每次都要多花 0.4 秒載 1 MB 的備份檔。
+        """
+        v = ws.cell(row=row, column=col).value
+        if isinstance(v, (int, float)):
+            return float(v)
+        raw = ws_raw.cell(row=row, column=col).value if ws_raw is not None else None
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        sheet = backup_sheet()
+        if sheet is not None:
+            v = sheet.cell(row=row, column=col).value
+            if isinstance(v, (int, float)):
+                return float(v)
+        if isinstance(raw, str) and raw.startswith("="):
+            return _safe_eval_arith(raw)
+        return None
+
+    overall: dict[str, list[dict]] = {}
+    for acc, layout in OVERALL_LAYOUT.items():
+        raw_rows = []
+        for col in range(OVERALL_FIRST_COL, OVERALL_LAST_COL + 1):
+            year = ws.cell(row=layout["year"], column=col).value
+            if not isinstance(year, (int, float)):
+                continue
+            raw_rows.append({
+                "year": int(year),
+                "cash": num(layout["cash"], col) or 0.0,
+                "settlement": num(layout["settlement"], col),
+                "inventory": num(layout["inventory"], col),
+            })
+
+        # 年初庫存讀不到時的補救，只做在「最新一個有結算的年度」上：那一格
+        # 的公式就是「前一年結算 + 當年現金調整」（我的戶頭 =G4、可橙
+        # =G10+H7），推得出來。更早的年度不補——歷年的公式長相不一致
+        # （例如 2022 是 ='2022損益表'!C4+D1，讀的是當年第一週的庫存而不是
+        # 前一年結算），硬推會得到看似合理卻錯誤的數字，寧可讓那一年消失。
+        last_idx = max((i for i, r in enumerate(raw_rows) if r["settlement"] is not None),
+                       default=None)
+        if last_idx is not None and raw_rows[last_idx]["inventory"] is None and last_idx > 0:
+            prev = raw_rows[last_idx - 1]["settlement"]
+            if prev is not None:
+                raw_rows[last_idx]["inventory"] = prev + raw_rows[last_idx]["cash"]
+
+        rows = []
+        for r in raw_rows:
+            inventory, settlement = r["inventory"], r["settlement"]
+            if inventory is None or settlement is None or not inventory:
+                continue
+            pnl = settlement - inventory
+            rows.append({
+                "year": r["year"],
+                "inventory": inventory,
+                "settlement": settlement,
+                "pnl": pnl,
+                "performance": pnl / inventory,
+                "cashAdjust": r["cash"],
+            })
+        overall[acc] = rows
+
+    return {"ok": True, "overall": overall}
+
+
 def save_browser_state(payload: dict) -> dict:
     """把瀏覽器 localStorage 的內容鏡像存成 mobile_state.json。
 
@@ -1447,7 +1586,8 @@ def build_snapshot() -> dict:
     snapshot: dict[str, dict] = {}
     for key, fn in (("prices", read_prices_with_basis),
                     ("balance", read_xlsx_balance),
-                    ("weekly", read_xlsx_weekly)):
+                    ("weekly", read_xlsx_weekly),
+                    ("overall", read_xlsx_overall)):
         try:
             snapshot[key] = fn()
         except Exception as exc:  # noqa: BLE001
@@ -1602,6 +1742,14 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": False,
                     "error": f"{type(exc).__name__}: {exc}",
                 })
+            return
+
+        if path == "/api/xlsx-overall":
+            try:
+                self._send_json(200, read_xlsx_overall())
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                self._send_json(200, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
             return
 
         if path == "/api/xlsx-weekly":

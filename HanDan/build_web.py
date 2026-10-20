@@ -187,6 +187,9 @@ BOOT_SCRIPT = """<script>
     if (url.indexOf('/api/xlsx-prices') !== -1)  return snapshotReady.then(function (s) { return reply(s.prices);  });
     if (url.indexOf('/api/xlsx-balance') !== -1) return snapshotReady.then(function (s) { return reply(s.balance); });
     if (url.indexOf('/api/xlsx-weekly') !== -1)  return snapshotReady.then(function (s) { return reply(s.weekly);  });
+    // 舊的快照沒有 overall 這一項，補成明確的失敗，讓前端退回靜態基準資料
+    if (url.indexOf('/api/xlsx-overall') !== -1) return snapshotReady.then(function (s) {
+      return reply(s.overall || { ok: false, error: '快照沒有總績效資料' }); });
     if (url.indexOf('/api/') !== -1) {
       return Promise.resolve(reply({ ok: false, error: '雲端版為唯讀，請在電腦上操作。' }));
     }

@@ -546,8 +546,8 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
         </div>
         <div class="chart-box"><canvas id="weeklyChart"></canvas></div>
 
-        <div class="section-title"><span class="num">2</span>歷年績效走勢</div>
-        <p class="section-desc">股本、庫存與績效逐年變化。</p>
+        <div class="section-title"><span class="num">2</span>歷年庫存績效走勢</div>
+        <p class="section-desc">年度損益 ＝ 當年結算 − 年初庫存；年度績效 ＝ 年度損益 ÷ 年初庫存。年初庫存已把當年的現金加碼／提領算進去，與 <code>菡萏咖啡.xlsx</code>「總績效」分頁同一套規則。</p>
         <div class="grid grid-2" id="yearlyMetrics" style="margin-bottom:18px;"></div>
         <div class="chart-box"><canvas id="yearlyChart"></canvas></div>
       </div>
@@ -872,6 +872,7 @@ const state = {
   pendingDividendBaseline: { main: null, keqiang: null }, // 從 菡萏咖啡.xlsx 標示「(未入帳)」左邊的值讀到的基準值
   xlsxWeekly: { main: [], keqiang: [] }, // 從 菡萏咖啡.xlsx 當年損益表 A4:I55 讀到的每週記帳（含週績效），每次連線 serve.py 才會有
   xlsxWeeklyYear: null, // xlsxWeekly 對應的年度
+  xlsxOverall: { main: [], keqiang: [] }, // 從 菡萏咖啡.xlsx「總績效」分頁讀到的歷年年初庫存／當年結算，見 loadXlsxOverall
   confirmedStocks: { main: null, keqiang: null }, // baked-in baseline after "確認並存檔"
   confirmedDelta: { main: { costDelta: 0, valueDelta: 0 }, keqiang: { costDelta: 0, valueDelta: 0 } },
   divSchedule: { main: {}, keqiang: {} }, // {acc: {etfName: {tier, semiMonths?, annualMonth?}}}
@@ -1295,6 +1296,22 @@ async function loadXlsxWeekly() {
   }
 }
 
+// 讀「菡萏咖啡.xlsx」的「總績效」分頁，作為「歷年庫存績效走勢」的準。
+// 關鍵差別是年初庫存：Excel 已經把當年的現金加碼／提領算進去（可橙 2026
+// 是 -1,460,000），PORTFOLIO_DATA.overall 這份靜態快照沒有，分母會高估。
+async function loadXlsxOverall() {
+  if (!location.protocol.startsWith('http')) return;
+  try {
+    const res = await fetch('/api/xlsx-overall', { cache: 'no-store' });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.ok && data.overall) state.xlsxOverall = data.overall;
+    }
+  } catch (e) {
+    console.warn('讀取 xlsx 總績效失敗：', e);
+  }
+}
+
 async function loadConfirmedState() {
   for (const acc of ['main', 'keqiang']) {
     try {
@@ -1373,11 +1390,26 @@ function computeHoldingsDelta(acc) {
   return { costDelta, valueDelta, pnlDelta: valueDelta - costDelta, changed: costDelta !== 0 || valueDelta !== 0 };
 }
 
-// Latest-year overall summary, adjusted by the holdings delta so the
-// yearly cards/chart reflect edits made in the 持股明細 tab.
+// 歷年庫存績效：
+//   年度損益 = 當年結算 − 年初庫存
+//   年度績效 = 年度損益 ÷ 年初庫存
+// 年初庫存會因當年的現金加碼／提領而調整，規則就是 xlsx「總績效」分頁那張
+// 表（見 serve.py read_xlsx_overall）。有連上 serve.py 就逐年以它為準，
+// PORTFOLIO_DATA.overall 只用來補 xlsx 沒有的年度——那份靜態快照的年初庫存
+// 單純等於前一年結算，沒有現金調整這一層。
 function syncedOverall(acc) {
-  const rows = (PORTFOLIO_DATA.overall[acc] || []).map(r => ({ ...r }));
+  const xlsxRows = (state.xlsxOverall[acc] || []).map(r => ({ ...r, xlsx: true }));
+  const byYear = new Map(xlsxRows.map(r => [Number(r.year), r]));
+  const rows = (PORTFOLIO_DATA.overall[acc] || [])
+    .map(r => byYear.get(Number(r.year)) || { ...r });
+  const known = new Set(rows.map(r => Number(r.year)));
+  xlsxRows.forEach(r => { if (!known.has(Number(r.year))) rows.push(r); });
+  rows.sort((a, b) => Number(a.year) - Number(b.year));
   if (rows.length === 0) return rows;
+  // xlsx 的「當年結算」是使用者自己在 Excel 記的即時庫存，不該再疊加持股
+  // 明細算出來的 delta——兩者統計口徑不一定相同，疊加只會讓數字偏離 Excel
+  // 實際顯示的值（理由同 syncedWeekly）。
+  if (rows[rows.length - 1].xlsx) return rows;
   const delta = computeHoldingsDelta(acc);
   if (!delta.changed) return rows;
   const last = rows[rows.length - 1];
@@ -1727,7 +1759,18 @@ function renderYearlyChart() {
         legend: { labels: { font: { family: "'Noto Sans TC'" }, color:'#22314f' } },
         tooltip: {
           callbacks: {
-            label: (c) => c.dataset.yAxisID === 'y1' ? ` 績效：${c.raw.toFixed(2)}%` : ` 損益：${fmtMoney(c.raw)}`
+            label: (c) => c.dataset.yAxisID === 'y1' ? ` 績效：${c.raw.toFixed(2)}%` : ` 損益：${fmtMoney(c.raw)}`,
+            // 分母是什麼要看得到，否則「年初庫存被現金調整過」這件事只存在
+            // Excel 裡，網頁上對不起來時無從查起。
+            footer: (items) => {
+              const r = rows[items[0].dataIndex];
+              if (!r) return '';
+              const lines = [`年初庫存 ${fmtMoney(r.inventory)}　→　當年結算 ${fmtMoney(r.settlement)}`];
+              if (r.cashAdjust) {
+                lines.push(`年初庫存含現金${r.cashAdjust > 0 ? '加碼' : '提領'} ${fmtMoney(r.cashAdjust)}`);
+              }
+              return lines.join('\n');
+            }
           }
         }
       },
@@ -4894,6 +4937,7 @@ function renderAll() {
     // 開啟當下的舊基準，把上一週的損益也算進當週，數字會整整多一週。
     // 這裡先重讀一次，再抓價，最後由 fetchClosePrice 統一重繪。
     await loadXlsxWeekly();
+    await loadXlsxOverall();
     await loadAccountBalanceBaseline();
 
     await fetchClosePrice(statusEl, syncXlsx);
@@ -4973,6 +5017,11 @@ function renderAll() {
     await loadXlsxWeekly();
   } catch (e) {
     console.error('loadXlsxWeekly failed:', e);
+  }
+  try {
+    await loadXlsxOverall();
+  } catch (e) {
+    console.error('loadXlsxOverall failed:', e);
   }
 
   renderTypeFilter();
