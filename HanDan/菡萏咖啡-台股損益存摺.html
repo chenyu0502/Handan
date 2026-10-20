@@ -1408,7 +1408,9 @@ function syncedWeekly(acc, year) {
   last.cost = (last.cost || 0) + delta.costDelta;
   last.inventory = (last.inventory || 0) + delta.valueDelta;
   last.total_pnl = last.inventory - last.cost;
-  last.cum_pct = last.cost ? last.total_pnl / last.cost : last.cum_pct;
+  // 分母跟 combinedWeekly 一致：優先用「當年成本」，沒填才用這一列的總成本
+  const costBase = yearCostBaseOf(acc, year) || last.cost;
+  last.cum_pct = costBase ? last.total_pnl / costBase : last.cum_pct;
   const prev = data[data.length - 2];
   last.wow_pct = prev ? last.cum_pct - prev.cum_pct : last.cum_pct;
   last.holdingsSynced = true;
@@ -1437,6 +1439,29 @@ function combinedWeekly(acc, year) {
   ];
   const custom = (state.customWeekly[acc][year] || []).map(e => ({...e, custom:true}));
   const all = [...base, ...custom].sort((a,b) => a.date.localeCompare(b.date));
+
+  // 累計績效 =（即時庫存 − 總成本）÷ 當年成本（年初庫存）。
+  // 分母改用固定的年初成本，不用每一列自己的總成本：xlsx 的 B 欄會隨年中
+  // 存提款變動（可橙 2026 就從 4,122,506 掉到 2,222,506），分母一縮，累計
+  // 績效線就憑空往上跳一段，看起來像賺了，其實只是提領。分子仍用各列自己
+  // 的總成本算損益——那是當下真實的本金；只有分母固定。
+  // 週績效 = 本週累計績效 − 上週累計績效，分母換了必須一起重算；每年第一
+  // 列沒有前一列可比，沿用原本的規則（當週損益 ÷ 分母，銜接去年年底）。
+  // 沒填當年成本的年度完全不動，維持 xlsx／靜態資料原本的值。
+  // all 的每一筆都已經是複本（上面三個 map 都展開過），可以直接改。
+  const costBase = yearCostBaseOf(acc, year);
+  if (costBase) {
+    all.forEach((r, i) => {
+      const pnl = (r.total_pnl != null) ? r.total_pnl
+        : ((r.inventory != null && r.cost != null) ? r.inventory - r.cost : null);
+      if (pnl != null) r.cum_pct = pnl / costBase;
+      if (i === 0) {
+        if (r.week_pnl != null) r.wow_pct = r.week_pnl / costBase;
+      } else if (r.cum_pct != null && all[i - 1].cum_pct != null) {
+        r.wow_pct = r.cum_pct - all[i - 1].cum_pct;
+      }
+    });
+  }
 
   // 原始 Excel 預先建好整年 52 列，尚未到來的週次是把最後一筆真實記錄
   // 往下複製的佔位列，不是實際觀測值。標記為 placeholder 而非直接排除，
@@ -1754,6 +1779,8 @@ function renderWeeklyChart() {
   const cum = data.map(d => d.cum_pct * 100);
 
   // 週績效 = 本週累計績效 − 上週累計績效。
+  // 注意：有填「當年成本」的年度，cum_pct／wow_pct 已經在 combinedWeekly
+  // 用固定分母重算過，下面拿到的就是重算後的值，這裡不必再換算一次。
   // 當年資料（d.xlsx）直接採用 菡萏咖啡.xlsx 算出的 wow_pct（見 loadXlsxWeekly，
   // 跟 xlsx 內 I 欄「與前一周比」同一套規則）；其餘（歷史年度、手動新增、
   // 持股同步後的資料點）仍即時計算，維持原本的一致性。
