@@ -96,7 +96,22 @@ Both scripts share the same closing-price logic (`serve.py` imports `fetch_close
 
 `EMBEDDED_PRICES` in the HTML is the final fallback, used only when `serve.py` isn't reachable at all (e.g. opening the HTML file directly instead of via `開啟存摺.bat`/`serve.py`) or when both API calls fail — the front end's `fetchClosePrice()` (菡萏咖啡-台股損益存摺.html) threads a `syncXlsx` flag through to pick the right endpoint and to tell the two failure modes apart in the status message ("not running via serve.py" vs "serve.py is up but reading/writing the xlsx failed").
 
-**所有讀 xlsx 數值的路徑都走 `xlsx_cell(ws_cached, ws_raw, coord)`**（`read_xlsx_weekly`、`read_xlsx_overall`、`read_xlsx_balance`、`_find_pending_dividend`、`_read_balance_and_pending`、`_read_existing_stock_dividend`）。順序是：主檔公式快取 → 公式版的字面數值 → 純算式自己算（`_safe_eval_arith`，L 欄的 `=0.699*1000-10` 這類）→ `xlsx_cache.json` 備援表。純算式排在備援表前面，因為它反映「現在的公式」，備援表只反映「上一次讀到的結果」。讀到快取值時順手寫進備援表，函式結束時 `memo_flush()` 落地。新增讀取路徑時沿用這支，不要自己讀 `.value`。實測：把整本快取清空後（且目錄下沒有手操版），weekly/overall/balance 三組結果與清空前的最大相對誤差 2e-14。
+**所有讀 xlsx 數值的路徑都走 `xlsx_cell(ws_cached, ws_raw, coord)`**（`read_xlsx_weekly`、`read_xlsx_overall`、`read_xlsx_balance`、`_find_pending_dividend`、`_read_balance_and_pending`、`_read_existing_stock_dividend`）。順序是：
+
+1. 主檔公式快取（讀到就順手寫進備援表）
+2. 公式版的字面數值
+3. 自己算公式：`_safe_eval_arith` 處理純算式（L 欄的 `=0.699*1000-10`），`_resolve_formula` 再處理含儲存格參照的（`=$B$1`、`=H2-N2`、`='2025損益表'!B1`），參照會遞迴追下去
+4. `xlsx_cache.json` 備援表
+
+公式自己算排在備援表前面，因為它反映「現在的公式」，備援表只反映「上一次讀到的結果」。新增讀取路徑時沿用這支，不要自己讀 `.value`。
+
+**第 3 步的參照解析不是可有可無的最佳化。** 損益表整欄 B（股本）是 `=$B$1`，B1 是 `=H2-N2`，H2 是 `='2025損益表'!B1`——寫入現價清掉快取後這些全部讀成 None，少了這一層，我的戶頭 2026 的週記帳會從 41 列掉到 21 列（六月之後整批消失），當週損益變成跟五月比、圖表也斷在五月。`_resolve_formula` 碰到函式呼叫或範圍（`=SUM(G2:R2)`）就放棄，交給備援表；循環參照用 `seen` 集合擋住（不是遞迴層數——結果要跟「從哪裡開始追」無關，上層才能安心快取）。解析結果（含失敗）快取在公式版 workbook 上，否則同一條鏈會被重走上千次（實測 5.7 秒 → 0.8 秒）。
+
+**寫入前一定要先養備援表。** `=SUM(...)` 這種公式 `_resolve_formula` 追不下去，快取一清就真的沒有了。所有「載入→改→存檔」都走 `_open_for_write()`，它會先呼叫 `warm_memo_before_write()` 把三支讀取跑一遍。**不要直接 `openpyxl.load_workbook(xlsx_path, data_only=False)` 然後存檔**，那次寫入會把還沒記錄的快取永久清掉。
+
+`read_books()` 以 mtime+size 當鍵共用唯讀的活頁簿對（快取版＋公式版），三支讀取函式各自載入要三秒以上，而開啟頁面時它們是連續呼叫的。寫入用的活頁簿不走這裡。
+
+實測：把整本快取清空後（且目錄下沒有手操版），weekly/overall/balance 三組結果與清空前的最大相對誤差 2e-14。
 
 `update_xlsx_prices()`/`read_xlsx_prices()` in `serve.py` scan each `{year}損益表`/`{year}損益表 (可橙)` sheet from row 57 to the end, matching column-A product names/codes against `STOCK_CODE_MAP`/`ETF_CODES` rather than assuming fixed row ranges — this also naturally picks up the "借券(出借)" (securities-lending) sub-tables further down the sheet, which use the same column layout. Rows whose name isn't in the tracked set (sold/closed positions) are left untouched. Writing to the xlsx via `openpyxl` strips cached values from **every** formula cell in the whole workbook (not just the touched rows) until Excel is opened and recalculates on load — this is expected `openpyxl` behavior, not data loss, but don't be alarmed if a `data_only=True` read shows blanks for unrelated sheets right after a write.
 

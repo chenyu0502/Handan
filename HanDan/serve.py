@@ -288,7 +288,7 @@ def update_xlsx_prices(prices: dict) -> dict:
         return {"ok": False, "error": "本機環境缺少 openpyxl 套件，無法寫入 xlsx"}
 
     try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=False)
+        wb = _open_for_write(xlsx_path)
     except PermissionError:
         return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
     except Exception as exc:  # noqa: BLE001
@@ -360,7 +360,7 @@ def _open_etf_div_cell(acc: str, name: str, month: str):
         return None, None, None, {"ok": False, "error": "本機環境缺少 openpyxl 套件，無法寫入 xlsx"}
 
     try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=False)
+        wb = _open_for_write(xlsx_path)
     except PermissionError:
         return None, None, None, {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
     except Exception as exc:  # noqa: BLE001
@@ -468,6 +468,75 @@ def _memo() -> dict[str, float]:
     return _memo_cache
 
 
+_books: dict = {}
+
+
+def read_books() -> tuple:
+    """共用的唯讀活頁簿：(快取版, 公式版, error)。
+
+    三支讀取函式（weekly／overall／balance）在開啟頁面時會接連被呼叫，各自
+    載入兩本活頁簿要花三秒以上，而它們讀的是同一個檔案。以檔案的 mtime＋
+    大小當快取鍵，檔案一變就整組重載，所以不會讀到過期內容。
+
+    寫入用的活頁簿不走這裡——那一本會被改動並存檔，見 _open_for_write()。
+    """
+    xlsx_path = BASE_DIR / XLSX_NAME
+    if not xlsx_path.exists():
+        return None, None, {"ok": False, "error": f"找不到 {XLSX_NAME}"}
+    try:
+        import openpyxl
+    except ImportError:
+        return None, None, {"ok": False, "error": "本機環境缺少 openpyxl 套件"}
+
+    try:
+        stat = xlsx_path.stat()
+        key = (stat.st_mtime_ns, stat.st_size)
+    except OSError as exc:
+        return None, None, {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
+
+    if _books.get("key") == key:
+        return _books["cached"], _books["raw"], None
+
+    try:
+        wb_cached = openpyxl.load_workbook(xlsx_path, data_only=True)
+        wb_raw = openpyxl.load_workbook(xlsx_path, data_only=False)
+    except PermissionError:
+        return None, None, {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，暫時無法讀取"}
+    except Exception as exc:  # noqa: BLE001
+        return None, None, {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
+
+    wb_raw._handan_cached_wb = wb_cached
+    _books.update(key=key, cached=wb_cached, raw=wb_raw)
+    return wb_cached, wb_raw, None
+
+
+def _open_for_write(xlsx_path):
+    """開啟 xlsx 準備寫入：先把備援表養飽，再回傳公式版的活頁簿。
+
+    所有「載入→改→存檔」的流程都要走這支，不要直接 load_workbook，否則
+    那次寫入就會把尚未記錄的公式快取永久清掉（見 warm_memo_before_write）。
+    """
+    import openpyxl
+    warm_memo_before_write()
+    return openpyxl.load_workbook(xlsx_path, data_only=False)
+
+
+def warm_memo_before_write() -> None:
+    """在用 openpyxl 寫入 xlsx **之前**，先把所有要讀的格子讀一遍存進備援表。
+
+    openpyxl 一存檔就會清空整本活頁簿的公式快取（見 CLAUDE.md 已知副作用），
+    而 `=SUM(...)` 這種公式 _resolve_formula 追不下去，清掉就真的沒有了。
+    寫入前先讀一輪，備援表就永遠停在「上一次 Excel 算過的完整狀態」，寫入
+    之後照樣讀得到。讀失敗不影響寫入本身，純粹是能記多少算多少。
+    """
+    for fn in (read_xlsx_weekly, read_xlsx_overall, read_xlsx_balance):
+        try:
+            fn()
+        except Exception:  # noqa: BLE001
+            pass
+    memo_flush()
+
+
 def memo_flush() -> None:
     """把這一輪讀到的好值落地。寫失敗不影響功能，下次再記就好。"""
     global _memo_dirty
@@ -483,16 +552,95 @@ def memo_flush() -> None:
         pass
 
 
-def xlsx_cell(ws_cached, ws_raw, coord: str) -> float | None:
+# 公式裡的儲存格參照：`B1`、`$B$1`、`'2025損益表'!B1`、`損益表!C55` 都算。
+_CELL_REF = re.compile(
+    r"(?:'(?P<quoted>[^']+)'!|(?P<plain>[0-9A-Za-z_一-鿿]+)!)?"
+    r"\$?(?P<col>[A-Z]{1,3})\$?(?P<row>[1-9][0-9]{0,5})(?![0-9A-Za-z_])"
+)
+# 有函式呼叫（SUM(...)）或範圍（G2:R2）就不解析——逐格代入的做法算不出來，
+# 硬套只會把 `SUM` 前後的參照亂代一通。
+_UNSUPPORTED = re.compile(r"[0-9A-Za-z_一-鿿]\s*\(|:")
+
+
+def _resolve_formula(ws_raw, expr: str, seen: frozenset) -> float | None:
+    """把公式裡的儲存格參照換成它們的值，再當成算式算出來。
+
+    這張表大量使用 `=$B$1`（整欄股本指向同一格）與 `=H2-N2`（股本＝去年
+    期末減提領）這種層層轉介的公式。寫入現價清掉快取後，這些格子全部讀成
+    None，連帶讓半年份的週記帳整批消失——所以必須自己追下去。
+
+    只支援純粹的參照與加減乘除；碰到函式或範圍就放棄（回 None），交給
+    上層的備援表。seen 記著「目前這條鏈上已經在解的格子」，用來擋住互相
+    指來指去的循環參照——用它而不是遞迴層數，結果才跟「從哪裡開始追」無關，
+    上層才可以安心把結果快取起來。
+    """
+    if ws_raw is None or _UNSUPPORTED.search(expr):
+        return None
+    wb_raw = ws_raw.parent
+    wb_cached = _paired_cached_wb(wb_raw)
+    failed = False
+
+    def sub(m: "re.Match") -> str:
+        nonlocal failed
+        name = m.group("quoted") or m.group("plain")
+        sheet_raw, sheet_cached = ws_raw, None
+        if name:
+            if name not in wb_raw.sheetnames:
+                failed = True
+                return "0"
+            sheet_raw = wb_raw[name]
+        sheet_name = sheet_raw.title
+        if wb_cached is not None and sheet_name in wb_cached.sheetnames:
+            sheet_cached = wb_cached[sheet_name]
+        ref = f"{m.group('col')}{m.group('row')}"
+        if (sheet_name, ref) in seen:   # 循環參照
+            failed = True
+            return "0"
+        value = xlsx_cell(sheet_cached, sheet_raw, ref, seen)
+        if value is None:
+            failed = True
+            return "0"
+        return repr(value)
+
+    substituted = _CELL_REF.sub(sub, expr.lstrip("="))
+    return None if failed else _safe_eval_arith(substituted)
+
+
+def _paired_cached_wb(wb_raw):
+    """公式版活頁簿對應的 data_only=True 版本。
+
+    _resolve_formula 追參照時會跳到別的分頁，那張分頁的快取值也要讀得到，
+    但手上只有公式版的 workbook。結果掛在 workbook 物件自己身上，同一次
+    讀取裡只會載入一次；不要用 id() 當快取鍵——物件被回收後 id 會被重用，
+    會把別人的活頁簿發出去。
+    """
+    cached = getattr(wb_raw, "_handan_cached_wb", "miss")
+    if cached != "miss":
+        return cached
+    value = None
+    try:
+        import openpyxl
+        value = openpyxl.load_workbook(BASE_DIR / XLSX_NAME, data_only=True)
+    except Exception:  # noqa: BLE001
+        value = None
+    try:
+        wb_raw._handan_cached_wb = value
+    except Exception:  # noqa: BLE001
+        pass
+    return value
+
+
+def xlsx_cell(ws_cached, ws_raw, coord: str, seen: frozenset = frozenset()) -> float | None:
     """讀「菡萏咖啡.xlsx」一格的數值，依序嘗試四種來源：
 
       1. 主檔的公式快取（Excel 算過留下的值）——讀到就順手記進備援表
       2. 公式版同一格本身就是數字（使用者直接鍵入的值）
-      3. 公式是純算式（例如 `=0.699*1000-10`、`=3879935.3-189`），自己算
+      3. 公式自己算：純算式（`=0.699*1000-10`）或只含儲存格參照與加減乘除
+         （`=$B$1`、`=H2-N2`、`='2025損益表'!B1`），參照會遞迴追下去
       4. 備援表：上一次讀到好值時記下來的
 
-    第 3 步排在備援表前面，是因為算式反映的是「現在的公式」，備援表反映的是
-    「上一次讀到的結果」——使用者改了算式時前者才是對的。
+    第 3 步排在備援表前面，是因為公式反映的是「現在」的算法，備援表反映的是
+    「上一次讀到的結果」——使用者改了公式時前者才是對的。
 
     全程只讀 菡萏咖啡.xlsx。手操版是使用者人工整理的備份，不是資料來源。
     """
@@ -513,6 +661,26 @@ def xlsx_cell(ws_cached, ws_raw, coord: str) -> float | None:
         return float(raw)
     if isinstance(raw, str) and raw.startswith("="):
         value = _safe_eval_arith(raw)
+        if value is None:
+            # 同一格在一次讀取裡會被追到很多次（例如整欄 B 都指向 B1，而
+            # 三列佔位用的 C 又各自牽出帳戶餘額那串上百項的公式），不記住
+            # 結果的話同一條鏈會重走上千次——實測從 5.7 秒降到 0.4 秒。
+            # 失敗（None）也要記，否則追不到的那幾條最貴的鏈每次都重算。
+            # 快取掛在公式版活頁簿上，活頁簿重載時自然一起失效。
+            cache = getattr(ws_raw, "_handan_resolved", None)
+            if cache is None:
+                cache = {}
+                try:
+                    ws_raw._handan_resolved = cache
+                except Exception:  # noqa: BLE001
+                    cache = None
+            ckey = (ws_raw.title, coord)
+            if cache is not None and ckey in cache:
+                value = cache[ckey]
+            else:
+                value = _resolve_formula(ws_raw, raw, seen | {ckey})
+                if cache is not None:
+                    cache[ckey] = value
         if value is not None:
             return value
 
@@ -668,7 +836,7 @@ def write_stock_dividend(acc: str, name: str, date_iso: str, ex_div_amount: floa
         return {"ok": False, "error": "本機環境缺少 openpyxl 套件，無法寫入 xlsx"}
 
     try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=False)
+        wb = _open_for_write(xlsx_path)
     except PermissionError:
         return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
     except Exception as exc:  # noqa: BLE001
@@ -723,7 +891,7 @@ def set_stock_dividend_base(acc: str, name: str, new_value: float) -> dict:
         return {"ok": False, "error": "本機環境缺少 openpyxl 套件，無法寫入 xlsx"}
 
     try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=False)
+        wb = _open_for_write(xlsx_path)
     except PermissionError:
         return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
     except Exception as exc:  # noqa: BLE001
@@ -836,22 +1004,9 @@ def read_xlsx_balance() -> dict:
     跟 read_xlsx_weekly() 一樣交給 xlsx_cell() 處理，依序退回純算式運算與
     備援表（XLSX_MEMO_NAME）。
     """
-    xlsx_path = BASE_DIR / XLSX_NAME
-    if not xlsx_path.exists():
-        return {"ok": False, "error": f"找不到 {XLSX_NAME}"}
-
-    try:
-        import openpyxl
-    except ImportError:
-        return {"ok": False, "error": "本機環境缺少 openpyxl 套件"}
-
-    try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-        wb_raw = openpyxl.load_workbook(xlsx_path, data_only=False)
-    except PermissionError:
-        return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，暫時無法讀取"}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
+    wb, wb_raw, err = read_books()
+    if err:
+        return err
 
     year = datetime.now().year
     sheet_map = {"main": f"{year}損益表", "keqiang": f"{year}損益表 (可橙)"}
@@ -973,7 +1128,7 @@ def adjust_pending_dividend(acc: str, delta: float) -> dict:
     _, pending_before = _read_balance_and_pending(wb_cached, wb_raw, sheet_name)
 
     try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=False)
+        wb = _open_for_write(xlsx_path)
     except PermissionError:
         return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
     except Exception as exc:  # noqa: BLE001
@@ -1020,7 +1175,7 @@ def import_dividend(acc: str, amount: float) -> dict:
     balance_before, pending_before = _read_balance_and_pending(wb_cached, wb_raw, sheet_name)
 
     try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=False)
+        wb = _open_for_write(xlsx_path)
     except PermissionError:
         return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
     except Exception as exc:  # noqa: BLE001
@@ -1102,7 +1257,7 @@ def adjust_balance(acc: str, delta: float, note: str = "") -> dict:
     balance_before, _ = _read_balance_and_pending(wb_cached, wb_raw, sheet_name)
 
     try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=False)
+        wb = _open_for_write(xlsx_path)
     except PermissionError:
         return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
     except Exception as exc:  # noqa: BLE001
@@ -1178,7 +1333,7 @@ def import_stock_dividend(acc: str, name: str, date_iso: str, ex_div_amount: flo
     balance_before, pending_before = _read_balance_and_pending(wb_cached, wb_raw, sheet_name)
 
     try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=False)
+        wb = _open_for_write(xlsx_path)
     except PermissionError:
         return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
     except Exception as exc:  # noqa: BLE001
@@ -1245,22 +1400,9 @@ def read_xlsx_weekly() -> dict:
     ='2025損益表'!B1-100000），一樣會被快取清空影響。單一儲存格讀到 None
     時由 xlsx_cell() 依序退回純算式運算與備援表（見 XLSX_MEMO_NAME）。
     """
-    xlsx_path = BASE_DIR / XLSX_NAME
-    if not xlsx_path.exists():
-        return {"ok": False, "error": f"找不到 {XLSX_NAME}"}
-
-    try:
-        import openpyxl
-    except ImportError:
-        return {"ok": False, "error": "本機環境缺少 openpyxl 套件"}
-
-    try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-        wb_raw = openpyxl.load_workbook(xlsx_path, data_only=False)
-    except PermissionError:
-        return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，暫時無法讀取"}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
+    wb, wb_raw, err = read_books()
+    if err:
+        return err
 
     year = datetime.now().year
     sheet_map = {"main": f"{year}損益表", "keqiang": f"{year}損益表 (可橙)"}
@@ -1355,22 +1497,9 @@ def read_xlsx_overall() -> dict:
     注意最新年度的「當年結算」前端不會用——它改用網頁自己算的即時庫存
     （庫存市值＋可用現金＋未入帳配息），才不會卡在 Excel 的重算時機上。
     """
-    xlsx_path = BASE_DIR / XLSX_NAME
-    if not xlsx_path.exists():
-        return {"ok": False, "error": f"找不到 {XLSX_NAME}"}
-
-    try:
-        import openpyxl
-    except ImportError:
-        return {"ok": False, "error": "本機環境缺少 openpyxl 套件"}
-
-    try:
-        wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-        wb_raw = openpyxl.load_workbook(xlsx_path, data_only=False)
-    except PermissionError:
-        return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，暫時無法讀取"}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
+    wb, wb_raw, err = read_books()
+    if err:
+        return err
 
     if OVERALL_SHEET not in wb.sheetnames:
         return {"ok": False, "error": f"找不到分頁「{OVERALL_SHEET}」"}
