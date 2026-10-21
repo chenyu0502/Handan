@@ -269,6 +269,15 @@ def fetch_tpex() -> tuple[dict[str, float], str]:
     return _parse_quotes(rows), _extract_date(rows)
 
 
+def _to_price(v) -> float | None:
+    """把報價引擎的欄位轉成正數；"-"、空值、零與負數一律回 None。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
 def fetch_realtime_quotes(codes: list[str]) -> tuple[dict[str, float], dict[str, float], str]:
     """用上市櫃共用的即時報價引擎取得當日最後成交價與前一交易日收盤價。
 
@@ -324,14 +333,21 @@ def fetch_realtime_quotes(codes: list[str]) -> tuple[dict[str, float], dict[str,
             except (TypeError, ValueError):
                 pass
 
-            z = row.get("z")  # 最後成交價；收盤後即為當日收盤價。
-            if not z or z == "-":
-                continue
-            try:
-                value = float(z)
-            except ValueError:
-                continue
-            if value <= 0:
+            # 最後成交價；收盤後即為當日收盤價。
+            value = _to_price(row.get("z"))
+
+            # z 欄是「當前撮合區間的成交價」，不是「今天最後一筆成交」。
+            # 冷門商品當天有成交、但收盤那一盤沒成交時，z 會變成 "-"，真正
+            # 的最後成交價留在 trade.z（實測 00944 於 2026-10-21 成交 94 張、
+            # 最後一筆 09:56:30 成交 22.34，z 卻是 "-"，整檔被當成無成交而用
+            # 昨收 21.97 頂替，差了 0.37 元）。
+            # 只在 v（當日累計成交量）大於 0 時才採用 trade.z——真的整天沒
+            # 成交時 trade 裡留的是上一個交易日的舊價，不能拿來當今天的價。
+            # 實測：68 檔裡有 z 的 66 檔，z 與 trade.z 完全相同，沒有例外。
+            if value is None and _to_price(row.get("v")) is not None:
+                value = _to_price((row.get("trade") or {}).get("z"))
+
+            if value is None:
                 continue
 
             prices[code] = value
