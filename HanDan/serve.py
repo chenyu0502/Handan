@@ -47,9 +47,14 @@ HOST = "127.0.0.1"
 PORT = 8765
 HTML_NAME = "菡萏咖啡-台股損益存摺.html"
 XLSX_NAME = "菡萏咖啡.xlsx"
-# 使用者另存的手動整理版本；Excel 存檔時會重新計算，公式快取通常是完整的，
-# 用來補上 XLSX_NAME 因為 openpyxl 寫入而清空的公式快取。純備援，不存在就略過。
-BACKUP_XLSX_NAME = "菡萏咖啡_手操版.xlsx"
+# 公式快取的備援值。寫入「現價」時 openpyxl 會清空全活頁簿的公式快取
+# （見 CLAUDE.md 已知副作用），之後整張表的公式格都讀成 None，直到使用者
+# 再用 Excel 開啟並存檔。這裡把每次「真的讀到數值」的格子記下來，下次讀不到
+# 時拿上一次的好值頂替。
+#
+# 唯一的資料來源是 菡萏咖啡.xlsx 自己——使用者另存的手操版是人工整理的備份，
+# 不是資料來源，任何讀取路徑都不得去讀它。
+XLSX_MEMO_NAME = "xlsx_cache.json"
 # 瀏覽器端手動編輯的鏡像檔。這些資料原本只存在 localStorage，外部程式讀不到，
 # 手機版因此看不到使用者在電腦上做的修改；頁面每次寫入 storage 就鏡像一份到
 # 這裡，讓 build_web.py／雲端快照能把最新狀態一起帶到手機。
@@ -446,6 +451,78 @@ def clear_etf_dividend(acc: str, name: str, month: str) -> dict:
 STOCK_DIV_COL = "L"
 
 
+_memo_cache: dict[str, float] | None = None
+_memo_dirty = False
+
+
+def _memo() -> dict[str, float]:
+    """載入（或建立）公式快取備援表；格式是 {"分頁名!座標": 數值}。"""
+    global _memo_cache
+    if _memo_cache is None:
+        path = BASE_DIR / XLSX_MEMO_NAME
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:  # noqa: BLE001
+            loaded = {}
+        _memo_cache = loaded if isinstance(loaded, dict) else {}
+    return _memo_cache
+
+
+def memo_flush() -> None:
+    """把這一輪讀到的好值落地。寫失敗不影響功能，下次再記就好。"""
+    global _memo_dirty
+    if not _memo_dirty:
+        return
+    try:
+        path = BASE_DIR / XLSX_MEMO_NAME
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(_memo(), ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+        _memo_dirty = False
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def xlsx_cell(ws_cached, ws_raw, coord: str) -> float | None:
+    """讀「菡萏咖啡.xlsx」一格的數值，依序嘗試四種來源：
+
+      1. 主檔的公式快取（Excel 算過留下的值）——讀到就順手記進備援表
+      2. 公式版同一格本身就是數字（使用者直接鍵入的值）
+      3. 公式是純算式（例如 `=0.699*1000-10`、`=3879935.3-189`），自己算
+      4. 備援表：上一次讀到好值時記下來的
+
+    第 3 步排在備援表前面，是因為算式反映的是「現在的公式」，備援表反映的是
+    「上一次讀到的結果」——使用者改了算式時前者才是對的。
+
+    全程只讀 菡萏咖啡.xlsx。手操版是使用者人工整理的備份，不是資料來源。
+    """
+    global _memo_dirty
+    key = f"{ws_cached.title}!{coord}" if ws_cached is not None else None
+
+    if ws_cached is not None:
+        v = ws_cached[coord].value
+        if isinstance(v, (int, float)):
+            value = float(v)
+            if key and _memo().get(key) != value:
+                _memo()[key] = value
+                _memo_dirty = True
+            return value
+
+    raw = ws_raw[coord].value if ws_raw is not None else None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str) and raw.startswith("="):
+        value = _safe_eval_arith(raw)
+        if value is not None:
+            return value
+
+    if key:
+        v = _memo().get(key)
+        if isinstance(v, (int, float)):
+            return float(v)
+    return None
+
+
 def _safe_eval_arith(expr: str) -> float | None:
     """安全地算出只含數字與 + - * / 的算式（例如 xlsx 裡常見的
     `0.699*1000-10` 或 `27399+3976+12990`），不支援函式呼叫或儲存格參照，
@@ -509,11 +586,11 @@ def _find_stock_div_row(ws) -> dict[str, int]:
 
 
 def _read_existing_stock_dividend(acc: str, name: str) -> tuple[float | None, dict | None]:
-    """讀 L 欄目前的累計配息金額。優先讀公式快取（data_only=True），
-    快取被清空（見 CLAUDE.md 已知副作用）時改讀 BACKUP_XLSX_NAME 的快取，
-    兩者都沒有時，嘗試安全解析公式本身（純數字加減乘除，無儲存格參照的
-    才解析得出來）。全部都讀不到就回傳 (None, error)，不悄悄當成 0，
-    避免使用者不知情下把舊配息蓋掉。
+    """讀 L 欄目前的累計配息金額。優先讀公式快取（data_only=True），快取被
+    清空（見 CLAUDE.md 已知副作用）時，由 xlsx_cell() 依序退回純算式運算
+    （股票區的 L 欄幾乎都是 `=0.699*1000-10` 這種純加減乘除）與備援表。
+    全部都讀不到就回傳 (None, error)，不悄悄當成 0，避免使用者不知情下把
+    舊配息蓋掉。
 
     回傳 (existing_amount, None) 或 (None, error_dict)。
     """
@@ -547,39 +624,21 @@ def _read_existing_stock_dividend(acc: str, name: str) -> tuple[float | None, di
     if row is None:
         return None, {"ok": False, "error": f"「{sheet_name}」股票區找不到商品「{name}」"}
 
-    try:
-        wb_cached = openpyxl.load_workbook(xlsx_path, data_only=True)
-        value = wb_cached[sheet_name].cell(row=row, column=12).value  # L 欄
-    except Exception:  # noqa: BLE001
-        value = None
-    if isinstance(value, (int, float)):
-        return float(value), None
-
-    backup_path = BASE_DIR / BACKUP_XLSX_NAME
-    if backup_path.exists():
-        try:
-            wb_backup_raw = openpyxl.load_workbook(backup_path, data_only=False)
-            wb_backup_cached = openpyxl.load_workbook(backup_path, data_only=True)
-            if sheet_name in wb_backup_raw.sheetnames:
-                backup_rows = _find_stock_div_row(wb_backup_raw[sheet_name])
-                backup_row = backup_rows.get(name)
-                if backup_row is not None:
-                    backup_value = wb_backup_cached[sheet_name].cell(row=backup_row, column=12).value
-                    if isinstance(backup_value, (int, float)):
-                        return float(backup_value), None
-        except Exception:  # noqa: BLE001
-            pass
-
-    raw_value = wb_raw[sheet_name].cell(row=row, column=12).value
-
+    ws_raw = wb_raw[sheet_name]
+    coord = ws_raw.cell(row=row, column=12).coordinate  # L 欄
+    raw_value = ws_raw.cell(row=row, column=12).value
     if raw_value is None:
         return 0.0, None  # 儲存格原本就是空的，原配息金額視為 0，這是唯一安全的「猜測」
-    if isinstance(raw_value, (int, float)):
-        return float(raw_value), None
-    if isinstance(raw_value, str) and raw_value.startswith("="):
-        evaluated = _safe_eval_arith(raw_value)
-        if evaluated is not None:
-            return evaluated, None
+
+    try:
+        ws_cached = openpyxl.load_workbook(xlsx_path, data_only=True)[sheet_name]
+    except Exception:  # noqa: BLE001
+        ws_cached = None
+
+    value = xlsx_cell(ws_cached, ws_raw, coord)
+    memo_flush()
+    if value is not None:
+        return value, None
 
     return None, {
         "ok": False,
@@ -750,24 +809,19 @@ def read_xlsx_prices() -> dict:
     }
 
 
-def _find_pending_dividend(ws, ws_backup=None) -> float | None:
+def _find_pending_dividend(ws, ws_raw=None) -> float | None:
     """在分頁裡找標示「(未入帳)」的儲存格，回傳它左邊那一格的數值。
 
     這個標籤在持股／借券小計區塊，代表已經算出但還沒實際入帳的配息金額；
     沒有固定的列號（隨持股筆數增減），逐格掃描比寫死列號穩固。左邊那格常是
-    公式，快取被清空（見 read_xlsx_balance 註解）時讀到 None，改讀
-    ws_backup 同一個座標的值來補。
+    公式，快取被清空（見 read_xlsx_balance 註解）時讀到 None，交給
+    xlsx_cell() 依序退回純算式運算與備援表。
     """
     for row in ws.iter_rows():
         for cell in row:
             if isinstance(cell.value, str) and "未入帳" in cell.value:
-                left = ws.cell(row=cell.row, column=cell.column - 1).value
-                if isinstance(left, (int, float)):
-                    return float(left)
-                if ws_backup is not None:
-                    left_backup = ws_backup.cell(row=cell.row, column=cell.column - 1).value
-                    if isinstance(left_backup, (int, float)):
-                        return float(left_backup)
+                left = ws.cell(row=cell.row, column=cell.column - 1)
+                return xlsx_cell(ws, ws_raw, left.coordinate)
     return None
 
 
@@ -779,9 +833,8 @@ def read_xlsx_balance() -> dict:
 
     B2 與未入帳配息左邊那格常是公式，寫入「現價」時 openpyxl 會清空全活頁簿
     的公式快取（見 CLAUDE.md 已知副作用），讀到 None 很正常，不代表資料遺失。
-    跟 read_xlsx_weekly() 一樣，讀到 None 時改讀 BACKUP_XLSX_NAME（使用者
-    另存的手動整理版本，Excel 存檔時已重新計算過，快取通常是完整的）同一格
-    的值來補。
+    跟 read_xlsx_weekly() 一樣交給 xlsx_cell() 處理，依序退回純算式運算與
+    備援表（XLSX_MEMO_NAME）。
     """
     xlsx_path = BASE_DIR / XLSX_NAME
     if not xlsx_path.exists():
@@ -794,18 +847,11 @@ def read_xlsx_balance() -> dict:
 
     try:
         wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+        wb_raw = openpyxl.load_workbook(xlsx_path, data_only=False)
     except PermissionError:
         return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，暫時無法讀取"}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
-
-    wb_backup = None
-    backup_path = BASE_DIR / BACKUP_XLSX_NAME
-    if backup_path.exists():
-        try:
-            wb_backup = openpyxl.load_workbook(backup_path, data_only=True)
-        except Exception:  # noqa: BLE001
-            wb_backup = None
 
     year = datetime.now().year
     sheet_map = {"main": f"{year}損益表", "keqiang": f"{year}損益表 (可橙)"}
@@ -817,13 +863,11 @@ def read_xlsx_balance() -> dict:
             pending_dividend[acc] = None
             continue
         ws = wb[sheet_name]
-        ws_backup = wb_backup[sheet_name] if (wb_backup and sheet_name in wb_backup.sheetnames) else None
-        value = ws["B2"].value
-        if not isinstance(value, (int, float)) and ws_backup is not None:
-            value = ws_backup["B2"].value
-        balance[acc] = float(value) if isinstance(value, (int, float)) else None
-        pending_dividend[acc] = _find_pending_dividend(ws, ws_backup)
+        ws_raw = wb_raw[sheet_name] if sheet_name in wb_raw.sheetnames else None
+        balance[acc] = xlsx_cell(ws, ws_raw, "B2")
+        pending_dividend[acc] = _find_pending_dividend(ws, ws_raw)
 
+    memo_flush()
     return {"ok": True, "balance": balance, "pendingDividend": pending_dividend}
 
 
@@ -879,37 +923,28 @@ def _append_delta_to_cell(cell, delta: float, cancel_last: bool = False) -> None
 
 
 def _load_balance_workbooks(xlsx_path):
-    """回傳 (wb_cached, wb_backup_cached, error)。wb_cached 用來讀取帳戶餘額／
-    未入帳配息「目前」的估計值（寫入前的基準），wb_backup_cached 是備援檔案
-    的快取版本，跟 read_xlsx_balance() 用同一套邏輯。"""
+    """回傳 (wb_cached, wb_raw, error)。wb_cached 用來讀取帳戶餘額／未入帳
+    配息「目前」的估計值（寫入前的基準），wb_raw 是公式版，讓 xlsx_cell()
+    在快取被清空時能退回純算式運算與備援表，跟 read_xlsx_balance() 同一套。"""
     import openpyxl
     try:
         wb_cached = openpyxl.load_workbook(xlsx_path, data_only=True)
+        wb_raw = openpyxl.load_workbook(xlsx_path, data_only=False)
     except PermissionError:
         return None, None, {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
     except Exception as exc:  # noqa: BLE001
         return None, None, {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
-
-    wb_backup_cached = None
-    backup_path = BASE_DIR / BACKUP_XLSX_NAME
-    if backup_path.exists():
-        try:
-            wb_backup_cached = openpyxl.load_workbook(backup_path, data_only=True)
-        except Exception:  # noqa: BLE001
-            wb_backup_cached = None
-    return wb_cached, wb_backup_cached, None
+    return wb_cached, wb_raw, None
 
 
-def _read_balance_and_pending(wb_cached, wb_backup_cached, sheet_name: str) -> tuple[float | None, float | None]:
+def _read_balance_and_pending(wb_cached, wb_raw, sheet_name: str) -> tuple[float | None, float | None]:
     if sheet_name not in wb_cached.sheetnames:
         return None, None
     ws = wb_cached[sheet_name]
-    ws_backup = wb_backup_cached[sheet_name] if (wb_backup_cached and sheet_name in wb_backup_cached.sheetnames) else None
-    value = ws["B2"].value
-    if not isinstance(value, (int, float)) and ws_backup is not None:
-        value = ws_backup["B2"].value
-    balance = float(value) if isinstance(value, (int, float)) else None
-    pending = _find_pending_dividend(ws, ws_backup)
+    ws_raw = wb_raw[sheet_name] if (wb_raw and sheet_name in wb_raw.sheetnames) else None
+    balance = xlsx_cell(ws, ws_raw, "B2")
+    pending = _find_pending_dividend(ws, ws_raw)
+    memo_flush()
     return balance, pending
 
 
@@ -932,10 +967,10 @@ def adjust_pending_dividend(acc: str, delta: float) -> dict:
     year = datetime.now().year
     sheet_name = f"{year}損益表" if acc == "main" else f"{year}損益表 (可橙)"
 
-    wb_cached, wb_backup_cached, err = _load_balance_workbooks(xlsx_path)
+    wb_cached, wb_raw, err = _load_balance_workbooks(xlsx_path)
     if err is not None:
         return err
-    _, pending_before = _read_balance_and_pending(wb_cached, wb_backup_cached, sheet_name)
+    _, pending_before = _read_balance_and_pending(wb_cached, wb_raw, sheet_name)
 
     try:
         wb = openpyxl.load_workbook(xlsx_path, data_only=False)
@@ -979,10 +1014,10 @@ def import_dividend(acc: str, amount: float) -> dict:
     year = datetime.now().year
     sheet_name = f"{year}損益表" if acc == "main" else f"{year}損益表 (可橙)"
 
-    wb_cached, wb_backup_cached, err = _load_balance_workbooks(xlsx_path)
+    wb_cached, wb_raw, err = _load_balance_workbooks(xlsx_path)
     if err is not None:
         return err
-    balance_before, pending_before = _read_balance_and_pending(wb_cached, wb_backup_cached, sheet_name)
+    balance_before, pending_before = _read_balance_and_pending(wb_cached, wb_raw, sheet_name)
 
     try:
         wb = openpyxl.load_workbook(xlsx_path, data_only=False)
@@ -1061,10 +1096,10 @@ def adjust_balance(acc: str, delta: float, note: str = "") -> dict:
     year = datetime.now().year
     sheet_name = f"{year}損益表" if acc == "main" else f"{year}損益表 (可橙)"
 
-    wb_cached, wb_backup_cached, err = _load_balance_workbooks(xlsx_path)
+    wb_cached, wb_raw, err = _load_balance_workbooks(xlsx_path)
     if err is not None:
         return err
-    balance_before, _ = _read_balance_and_pending(wb_cached, wb_backup_cached, sheet_name)
+    balance_before, _ = _read_balance_and_pending(wb_cached, wb_raw, sheet_name)
 
     try:
         wb = openpyxl.load_workbook(xlsx_path, data_only=False)
@@ -1137,10 +1172,10 @@ def import_stock_dividend(acc: str, name: str, date_iso: str, ex_div_amount: flo
     year = datetime.now().year
     sheet_name = f"{year}損益表" if acc == "main" else f"{year}損益表 (可橙)"
 
-    wb_cached, wb_backup_cached, load_err = _load_balance_workbooks(xlsx_path)
+    wb_cached, wb_raw, load_err = _load_balance_workbooks(xlsx_path)
     if load_err is not None:
         return load_err
-    balance_before, pending_before = _read_balance_and_pending(wb_cached, wb_backup_cached, sheet_name)
+    balance_before, pending_before = _read_balance_and_pending(wb_cached, wb_raw, sheet_name)
 
     try:
         wb = openpyxl.load_workbook(xlsx_path, data_only=False)
@@ -1208,8 +1243,7 @@ def read_xlsx_weekly() -> dict:
 
     B／C 本身也可能是公式（例如可橙戶頭整欄 B 是 =$B$1，我的戶頭的 B1 是
     ='2025損益表'!B1-100000），一樣會被快取清空影響。單一儲存格讀到 None
-    時，改讀 BACKUP_XLSX_NAME（使用者另存的手動整理版本，Excel 存檔時已
-    重新計算過，快取通常是完整的）同一格的值來補。
+    時由 xlsx_cell() 依序退回純算式運算與備援表（見 XLSX_MEMO_NAME）。
     """
     xlsx_path = BASE_DIR / XLSX_NAME
     if not xlsx_path.exists():
@@ -1222,24 +1256,11 @@ def read_xlsx_weekly() -> dict:
 
     try:
         wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+        wb_raw = openpyxl.load_workbook(xlsx_path, data_only=False)
     except PermissionError:
         return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，暫時無法讀取"}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
-
-    wb_backup = None
-    backup_path = BASE_DIR / BACKUP_XLSX_NAME
-    if backup_path.exists():
-        try:
-            wb_backup = openpyxl.load_workbook(backup_path, data_only=True)
-        except Exception:  # noqa: BLE001
-            wb_backup = None
-
-    def resolve_cell(ws, ws_backup, coord: str):
-        value = ws[coord].value
-        if value is None and ws_backup is not None:
-            value = ws_backup[coord].value
-        return value
 
     year = datetime.now().year
     sheet_map = {"main": f"{year}損益表", "keqiang": f"{year}損益表 (可橙)"}
@@ -1250,8 +1271,8 @@ def read_xlsx_weekly() -> dict:
         if sheet_name not in wb.sheetnames:
             continue
         ws = wb[sheet_name]
-        ws_backup = wb_backup[sheet_name] if (wb_backup and sheet_name in wb_backup.sheetnames) else None
-        resolved = lambda coord: resolve_cell(ws, ws_backup, coord)  # noqa: E731
+        ws_raw = wb_raw[sheet_name] if sheet_name in wb_raw.sheetnames else None
+        resolved = lambda coord: xlsx_cell(ws, ws_raw, coord)  # noqa: E731
 
         b1 = resolved("B1")  # 股本；部分分頁每列的 B 欄是公式（=$B$1 或跨年度公式），快取清空時退回讀這裡。
         rows = []
@@ -1285,9 +1306,9 @@ def read_xlsx_weekly() -> dict:
         prev_sheet_name = prev_sheet_map[acc]
         if prev_sheet_name in wb.sheetnames:
             ws_prev = wb[prev_sheet_name]
-            ws_prev_backup = wb_backup[prev_sheet_name] if (wb_backup and prev_sheet_name in wb_backup.sheetnames) else None
-            prev_cost = resolve_cell(ws_prev, ws_prev_backup, "B55")
-            prev_inv = resolve_cell(ws_prev, ws_prev_backup, "C55")
+            ws_prev_raw = wb_raw[prev_sheet_name] if prev_sheet_name in wb_raw.sheetnames else None
+            prev_cost = xlsx_cell(ws_prev, ws_prev_raw, "B55")
+            prev_inv = xlsx_cell(ws_prev, ws_prev_raw, "C55")
             if isinstance(prev_cost, (int, float)) and isinstance(prev_inv, (int, float)):
                 prev_year_end_pnl = prev_inv - prev_cost
 
@@ -1300,6 +1321,7 @@ def read_xlsx_weekly() -> dict:
                 row["wow_pct"] = row["cum_pct"] - rows[i - 1]["cum_pct"]
         weekly[acc] = rows
 
+    memo_flush()
     return {"ok": True, "year": year, "weekly": weekly}
 
 
@@ -1325,10 +1347,13 @@ def read_xlsx_overall() -> dict:
     有：年初庫存 = 前一年結算 + 當年現金調整（我的戶頭第 1 列、可橙第 7 列）。
     可橙 2026 的調整是 -1,460,000，少了這一層，分母會高估、績效被低估。
 
-    公式快取被 openpyxl 寫入清空時（見 CLAUDE.md 已知副作用）的補救順序跟
-    read_xlsx_weekly 一致：主檔快取 → BACKUP_XLSX_NAME 快取 → 自己推算
-    （前一年結算 + 現金調整，現金調整那格是純算式，可以安全解析）。全部都
-    讀不到的年度直接略過，不硬湊數字。
+    公式快取被 openpyxl 寫入清空時（見 CLAUDE.md 已知副作用）的補救由
+    xlsx_cell() 統一處理：主檔快取 → 公式版的字面數值 → 純算式自己算 →
+    備援表（XLSX_MEMO_NAME）。最後還有一層自己推算（前一年結算 + 現金
+    調整）。全部都讀不到的年度直接略過，不硬湊數字。
+
+    注意最新年度的「當年結算」前端不會用——它改用網頁自己算的即時庫存
+    （庫存市值＋可用現金＋未入帳配息），才不會卡在 Excel 的重算時機上。
     """
     xlsx_path = BASE_DIR / XLSX_NAME
     if not xlsx_path.exists():
@@ -1341,6 +1366,7 @@ def read_xlsx_overall() -> dict:
 
     try:
         wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+        wb_raw = openpyxl.load_workbook(xlsx_path, data_only=False)
     except PermissionError:
         return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，暫時無法讀取"}
     except Exception as exc:  # noqa: BLE001
@@ -1350,52 +1376,10 @@ def read_xlsx_overall() -> dict:
         return {"ok": False, "error": f"找不到分頁「{OVERALL_SHEET}」"}
 
     ws = wb[OVERALL_SHEET]
-    try:
-        ws_raw = openpyxl.load_workbook(xlsx_path, data_only=False)[OVERALL_SHEET]
-    except Exception:  # noqa: BLE001
-        ws_raw = None
-
-    # 備份檔有 1 MB 以上，載入就要 0.4 秒，而且只有在主檔的公式快取被清空時
-    # 才用得到，所以延後到真的讀不到值時才載。
-    _backup: list = []
-
-    def backup_sheet():
-        if not _backup:
-            sheet = None
-            try:
-                path = BASE_DIR / BACKUP_XLSX_NAME
-                if path.exists():
-                    book = openpyxl.load_workbook(path, data_only=True)
-                    if OVERALL_SHEET in book.sheetnames:
-                        sheet = book[OVERALL_SHEET]
-            except Exception:  # noqa: BLE001
-                sheet = None
-            _backup.append(sheet)
-        return _backup[0]
+    ws_raw = wb_raw[OVERALL_SHEET] if OVERALL_SHEET in wb_raw.sheetnames else None
 
     def num(row: int, col: int):
-        """主檔快取 → 備份檔快取 → 解析公式本身（純算式才解得出來）。
-
-        中間那一步前面先看一眼公式版的同一格：真的空白就直接回 None，不必
-        為了空格去載備份檔。這張表預留到 2030 年、現金調整那一列也多半是
-        空的，少了這道判斷等於每次都要多花 0.4 秒載 1 MB 的備份檔。
-        """
-        v = ws.cell(row=row, column=col).value
-        if isinstance(v, (int, float)):
-            return float(v)
-        raw = ws_raw.cell(row=row, column=col).value if ws_raw is not None else None
-        if raw is None:
-            return None
-        if isinstance(raw, (int, float)):
-            return float(raw)
-        sheet = backup_sheet()
-        if sheet is not None:
-            v = sheet.cell(row=row, column=col).value
-            if isinstance(v, (int, float)):
-                return float(v)
-        if isinstance(raw, str) and raw.startswith("="):
-            return _safe_eval_arith(raw)
-        return None
+        return xlsx_cell(ws, ws_raw, ws.cell(row=row, column=col).coordinate)
 
     overall: dict[str, list[dict]] = {}
     for acc, layout in OVERALL_LAYOUT.items():
@@ -1439,6 +1423,7 @@ def read_xlsx_overall() -> dict:
             })
         overall[acc] = rows
 
+    memo_flush()
     return {"ok": True, "overall": overall}
 
 

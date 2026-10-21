@@ -28,6 +28,11 @@ HanDan/mobile_state.json.tmp
 HanDan/prev_closes.json
 HanDan/prev_closes.json.tmp
 
+# Excel 公式快取的備援值（寫入現價會清空 xlsx 的公式快取）。
+# 含持股金額等個人財務資料，由 serve.py 自動寫入，刪掉也會自己長回來
+HanDan/xlsx_cache.json
+HanDan/xlsx_cache.json.tmp
+
 # Firebase 服務帳戶金鑰。等同資料庫的完整存取權，絕不可提交
 HanDan/firebase-service-account.json
 **/*service-account*.json

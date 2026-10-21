@@ -1390,6 +1390,17 @@ function computeHoldingsDelta(acc) {
   return { costDelta, valueDelta, pnlDelta: valueDelta - costDelta, changed: costDelta !== 0 || valueDelta !== 0 };
 }
 
+// 即時庫存 = 庫存市值總額 ＋ 可用現金 ＋ 未入帳配息。
+// 這就是 Excel 當年損益表 C55 那條公式在算的同一件事（=$F$138+$E$2+$L$136-$C$2），
+// 只是由網頁自己用目前的現價算，不必等 Excel 重算。讀不到完整資料時回傳
+// null，呼叫端自行退回別的來源，不要用 0 充數。
+function realtimeInventory(acc) {
+  const value = currentHoldingsValue(acc);
+  const cash = effectiveCash(acc);
+  if (!value || cash == null) return null;
+  return value + cash + (effectivePendingDividend(acc) || 0);
+}
+
 // 歷年庫存績效：
 //   年度損益 = 當年結算 − 年初庫存
 //   年度績效 = 年度損益 ÷ 年初庫存
@@ -1397,6 +1408,11 @@ function computeHoldingsDelta(acc) {
 // 表（見 serve.py read_xlsx_overall）。有連上 serve.py 就逐年以它為準，
 // PORTFOLIO_DATA.overall 只用來補 xlsx 沒有的年度——那份靜態快照的年初庫存
 // 單純等於前一年結算，沒有現金調整這一層。
+//
+// 最新年度的「當年結算」則改用網頁自己算的即時庫存，不讀 Excel：寫入現價
+// 時 openpyxl 會清掉 C55 的公式快取，要等使用者在 Excel 重算存檔才會更新，
+// 這張卡片因此會停在上一次存檔的數字。即時庫存同源於「今日／當週／年損益」
+// 三張卡片，彼此也不會再打架。
 function syncedOverall(acc) {
   const xlsxRows = (state.xlsxOverall[acc] || []).map(r => ({ ...r, xlsx: true }));
   const byYear = new Map(xlsxRows.map(r => [Number(r.year), r]));
@@ -1406,13 +1422,26 @@ function syncedOverall(acc) {
   xlsxRows.forEach(r => { if (!known.has(Number(r.year))) rows.push(r); });
   rows.sort((a, b) => Number(a.year) - Number(b.year));
   if (rows.length === 0) return rows;
-  // xlsx 的「當年結算」是使用者自己在 Excel 記的即時庫存，不該再疊加持股
-  // 明細算出來的 delta——兩者統計口徑不一定相同，疊加只會讓數字偏離 Excel
-  // 實際顯示的值（理由同 syncedWeekly）。
-  if (rows[rows.length - 1].xlsx) return rows;
+
+  const last = rows[rows.length - 1];
+  // 只套用在「今年」：更早的年度已經結算完畢，拿今天的行情去算沒有意義。
+  if (Number(last.year) === new Date().getFullYear()) {
+    const live = realtimeInventory(acc);
+    if (live != null && last.inventory) {
+      last.settlement = live;
+      last.pnl = live - last.inventory;
+      last.performance = last.pnl / last.inventory;
+      last.live = true;
+      return rows;
+    }
+  }
+
+  // 沒有即時庫存可用時的退路。xlsx 的「當年結算」是使用者自己在 Excel 記的
+  // 數字，不該再疊加持股明細算出來的 delta——兩者統計口徑不一定相同，疊加
+  // 只會讓數字偏離 Excel 實際顯示的值（理由同 syncedWeekly）。
+  if (last.xlsx) return rows;
   const delta = computeHoldingsDelta(acc);
   if (!delta.changed) return rows;
-  const last = rows[rows.length - 1];
   last.settlement = (last.settlement || 0) + delta.valueDelta;
   last.pnl = (last.pnl || 0) + delta.pnlDelta;
   last.performance = last.inventory ? last.pnl / last.inventory : last.performance;
@@ -1600,12 +1629,12 @@ function renderYearlyMetrics() {
   let adjustedCost = null;
   if (isLatestWeekly) {
     capAdj = capitalFlowSince(state.account, lastWeek.date);
-    const realtimeInventory = currentHoldingsValue(state.account)
+    const inventoryNow = currentHoldingsValue(state.account)
       + (effectiveCash(state.account) || 0)
       + (effectivePendingDividend(state.account) || 0);
     const cost = lastWeek.cost != null ? lastWeek.cost + capAdj : null;
     adjustedCost = cost;
-    const currentPnl = cost != null ? realtimeInventory - cost : null;
+    const currentPnl = cost != null ? inventoryNow - cost : null;
     if (currentPnl != null) {
       liveDeltaSinceLastWeek = (lastWeek.total_pnl != null) ? currentPnl - lastWeek.total_pnl : currentPnl;
       weekHoldingsSynced = true;
@@ -1765,10 +1794,11 @@ function renderYearlyChart() {
             footer: (items) => {
               const r = rows[items[0].dataIndex];
               if (!r) return '';
-              const lines = [`年初庫存 ${fmtMoney(r.inventory)}　→　當年結算 ${fmtMoney(r.settlement)}`];
+              const lines = [`年初庫存 ${fmtMoney(r.inventory)}　→　${r.live ? '即時庫存' : '當年結算'} ${fmtMoney(r.settlement)}`];
               if (r.cashAdjust) {
                 lines.push(`年初庫存含現金${r.cashAdjust > 0 ? '加碼' : '提領'} ${fmtMoney(r.cashAdjust)}`);
               }
+              if (r.live) lines.push('當年度為即時值：庫存市值＋可用現金＋未入帳配息');
               return lines.join('\n');
             }
           }
