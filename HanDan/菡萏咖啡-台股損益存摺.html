@@ -2339,6 +2339,7 @@ function openCashAdjustModal(anchorBtn) {
   modal.style.cssText = `position:fixed;z-index:999;top:${rect.bottom + 6}px;`
     + `left:${Math.max(8, Math.min(rect.right - 320, window.innerWidth - 340))}px;`;
   document.body.appendChild(modal);
+  fitModalIntoViewport(modal, rect);
   // 跟配息登記視窗一樣，抓住標題列可以拖曳移動
   makeDraggable(modal, modal.querySelector('.div-picker-title'));
 
@@ -2462,6 +2463,8 @@ function openCashAdjustModal(anchorBtn) {
         renderAll();
       });
     });
+    // 清單是動態塞進來的，視窗高度到這裡才定案，位置要重算一次
+    fitModalIntoViewport(modal, rect);
   };
   renderFlows();
 
@@ -3677,12 +3680,37 @@ function renderStockDivTable() {
 // 讓配息登記視窗可以用滑鼠拖曳移動：抓住標題列按住不放拖曳、放開結束，
 // 直接改 modal 的 left/top（modal 本身是 position:fixed，見各自的
 // style.cssText 設定）。mousedown 時擋掉預設行為避免拖曳時選取到文字。
+// 把彈出視窗收進可視範圍內。這些視窗都是 position:fixed、擺在觸發按鈕的
+// 正下方，內容一長就會整段掉到畫面外——而且因為是 fixed，捲動頁面也追不
+// 回來，使用者等於完全碰不到下半截（「存簿資金輸入」加上紀錄清單後高度
+// 644px、視窗只有 494px，整份清單與刪除鈕都看不到）。
+// 附加到畫面之後量實際高度：放不下就往上挪，再放不下就限制高度讓它自己捲。
+// 必須在 appendChild **以及內容都填好之後**才呼叫——量到的是當下的高度，
+// 之後才動態加進去的區塊（例如資金進出清單）不會被算到，視窗就又溢位了。
+// 使用者自己拖曳過就不再動它，免得內容一變又跳回按鈕下方。
+function fitModalIntoViewport(modal, anchorRect, margin = 8) {
+  if (modal.dataset.dragged) return;
+  // 先解除上一次設的高度上限再量，否則量到的是「被截短後」的高度，
+  // 第二次呼叫會以為已經放得下而不再往上挪（內容後來變高時就會這樣）。
+  modal.style.maxHeight = '';
+  const h = modal.offsetHeight;
+  let top = anchorRect.bottom + 6;
+  if (top + h > window.innerHeight - margin) {
+    top = Math.max(margin, window.innerHeight - margin - h);
+  }
+  modal.style.top = `${top}px`;
+  modal.style.maxHeight = `${window.innerHeight - top - margin}px`;
+  modal.style.overflowY = 'auto';
+}
+
 function makeDraggable(modal, handle) {
   handle.style.cursor = 'move';
   let startX = 0, startY = 0, startLeft = 0, startTop = 0;
   const onMouseMove = (e) => {
     modal.style.left = `${startLeft + (e.clientX - startX)}px`;
     modal.style.top = `${startTop + (e.clientY - startY)}px`;
+    // 使用者自己挪過位置之後就別再自動歸位（見 fitModalIntoViewport）
+    modal.dataset.dragged = '1';
   };
   const onMouseUp = () => {
     document.removeEventListener('mousemove', onMouseMove);
@@ -3763,6 +3791,7 @@ async function openStockDivEntryModal(td, acc) {
   const rect = td.getBoundingClientRect();
   modal.style.cssText = `position:fixed;z-index:999;top:${rect.bottom+6}px;left:${Math.min(rect.left,window.innerWidth-340)}px;`;
   document.body.appendChild(modal);
+  fitModalIntoViewport(modal, rect);
   makeDraggable(modal, modal.querySelector('.div-picker-title'));
 
   const dateInput = modal.querySelector('#divEntryDate');
@@ -4195,6 +4224,7 @@ function openDivEntryModal(td, acc) {
   const rect = td.getBoundingClientRect();
   modal.style.cssText = `position:fixed;z-index:999;top:${rect.bottom+6}px;left:${Math.min(rect.left,window.innerWidth-340)}px;`;
   document.body.appendChild(modal);
+  fitModalIntoViewport(modal, rect);
   makeDraggable(modal, modal.querySelector('.div-picker-title'));
 
   const dateInput = modal.querySelector('#divEntryDate');
@@ -4510,6 +4540,7 @@ function openDivSchedulePicker(etfName, acc, anchorBtn) {
   const rect = anchorBtn.getBoundingClientRect();
   picker.style.cssText = `position:fixed;z-index:999;top:${rect.bottom+6}px;left:${Math.min(rect.left,window.innerWidth-340)}px;`;
   document.body.appendChild(picker);
+  fitModalIntoViewport(picker, rect);
 
   let selTier = currentTier;
   let selSemi = [...currentSemi];
