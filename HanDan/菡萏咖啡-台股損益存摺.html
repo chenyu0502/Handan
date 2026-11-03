@@ -4810,6 +4810,28 @@ document.getElementById('submitEntry').addEventListener('click', async () => {
 
 const SIDE_LABEL = { buy: '買進', sell: '賣出' };
 
+// 每日買賣總覽與交易紀錄預設只露最新 TX_PREVIEW_ROWS 列，其餘收起來，表尾放一個
+// 展開鈕。展開只是檢視方式，不寫進儲存，重新整理後回到收合狀態。
+const TX_PREVIEW_ROWS = 10;
+const txExpanded = { summary: false, custom: false };
+
+// 表尾那一列：資料沒超過門檻就不產生，避免只有三筆也掛一顆沒用的按鈕。
+function txToggleRow(kind, total, cols, note = '') {
+  if (total <= TX_PREVIEW_ROWS) return '';
+  // 字串刻意壓短：手機上整張表比畫面寬，按鈕文字太長右半截會被切掉
+  const label = txExpanded[kind]
+    ? `收合，只顯示 ${TX_PREVIEW_ROWS} 筆`
+    : `展開全部 ${total} 筆${note}`;
+  // 靠左而不是置中：表格在手機上是可橫向捲動的，置中會讓按鈕落在整張表的
+  // 中點，得往右捲才按得到。
+  return `<tr><td colspan="${cols}" style="text-align:left"><button class="btn ghost" data-tx-toggle="${kind}">${label}<\/button><\/td><\/tr>`;
+}
+
+function bindTxToggle(table, kind, rerender) {
+  const btn = table.querySelector(`[data-tx-toggle="${kind}"]`);
+  if (btn) btn.addEventListener('click', () => { txExpanded[kind] = !txExpanded[kind]; rerender(); });
+}
+
 function renderCustomTable() {
   const rows = [];
   for (const acc of ['main','keqiang']) {
@@ -4829,8 +4851,9 @@ function renderCustomTable() {
     wrap.innerHTML = '<table id="customTable"><\/table>';
   }
   const table = document.getElementById('customTable');
+  const shown = txExpanded.custom ? rows : rows.slice(0, TX_PREVIEW_ROWS);
   const thead = `<thead><tr><th style="text-align:left">帳戶<\/th><th style="text-align:left">日期<\/th><th style="text-align:left">商品名稱<\/th><th>買／賣<\/th><th>平均成本<\/th><th>成交數量<\/th><th>手續費／交易稅<\/th><th>價金<\/th><th><\/th><\/tr><\/thead>`;
-  const tbody = `<tbody>${rows.map(r => `
+  const tbody = `<tbody>${shown.map(r => `
     <tr>
       <td style="text-align:left">${ACC_LABEL[r.acc]}<span class="tag-custom">手動<\/span><\/td>
       <td style="text-align:left">${r.date}<\/td>
@@ -4841,8 +4864,9 @@ function renderCustomTable() {
       <td>${r.fee ? fmtMoney(r.fee) : '—'}<\/td>
       <td>${fmtMoney(r.amount)}<\/td>
       <td><button class="btn ghost" data-del-acc="${r.acc}" data-del-year="${r.year}" data-del-idx="${r.idx}">刪除<\/button><\/td>
-    <\/tr>`).join('')}<\/tbody>`;
+    <\/tr>`).join('')}${txToggleRow('custom', rows.length, 9)}<\/tbody>`;
   table.innerHTML = thead + tbody;
+  bindTxToggle(table, 'custom', renderCustomTable);
   table.querySelectorAll('[data-del-acc]').forEach(btn => {
     btn.addEventListener('click', async () => {
       const acc = btn.dataset.delAcc, year = btn.dataset.delYear, idx = Number(btn.dataset.delIdx);
@@ -4906,8 +4930,13 @@ function renderWeeklyTxSummary() {
     wrap.innerHTML = '<table id="weeklyTxSummaryTable"><\/table>';
   }
   const table = document.getElementById('weeklyTxSummaryTable');
+  const shown = txExpanded.summary ? rows : rows.slice(0, TX_PREVIEW_ROWS);
+  // 被收起來的日期裡還有沒匯入的，就在展開鈕上講明——否則那顆「匯入」躲在
+  // 收合區裡，使用者不會知道還有一天沒併進帳戶餘額。
+  const hiddenPending = rows.slice(TX_PREVIEW_ROWS).filter(r => r.pending).length;
+  const hiddenPendingNote = hiddenPending ? `（${hiddenPending} 天未匯入）` : '';
   const thead = `<thead><tr><th style="text-align:left">帳戶<\/th><th style="text-align:left">日期<\/th><th>當日買進<\/th><th>當日賣出<\/th><th>投資明細<\/th><th><\/th><\/tr><\/thead>`;
-  const tbody = `<tbody>${rows.map(r => {
+  const tbody = `<tbody>${shown.map(r => {
     const net = r.sell - r.buy;
     return `
     <tr>
@@ -4920,8 +4949,9 @@ function renderWeeklyTxSummary() {
         ? `<button class="btn ghost" data-import-acc="${r.acc}" data-import-date="${r.date}">匯入<\/button>`
         : '<button class="btn ghost" disabled>已匯入 ✓<\/button>'}<\/td>
     <\/tr>`;
-  }).join('')}<\/tbody>`;
+  }).join('')}${txToggleRow('summary', rows.length, 6, hiddenPendingNote)}<\/tbody>`;
   table.innerHTML = thead + tbody;
+  bindTxToggle(table, 'summary', renderWeeklyTxSummary);
   table.querySelectorAll('[data-import-acc]').forEach(btn => {
     btn.addEventListener('click', () => importTxByDate(btn.dataset.importAcc, btn.dataset.importDate));
   });
