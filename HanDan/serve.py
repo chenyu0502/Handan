@@ -1386,6 +1386,138 @@ def import_stock_dividend(acc: str, name: str, date_iso: str, ex_div_amount: flo
     }
 
 
+# 損益表的每週記帳區：A 欄是該週的記帳日（週五），D 欄當週買進、E 欄當週賣出。
+# 跟 read_xlsx_weekly() 用同一個列範圍。
+WEEKLY_FIRST_ROW = 4
+WEEKLY_LAST_ROW = 55
+TX_SIDE_COL = {"buy": "D", "sell": "E"}
+
+
+def _weekly_row_for_date(ws, date_iso: str) -> int | None:
+    """交易日期對應到哪一列：A 欄的日期是「該週的記帳日」（週五），所以一筆
+    交易屬於第一個「記帳日 >= 交易日」的那一列。12/31 那列（年度最後一列）
+    不一定是週五，用同一條規則也會落在正確的地方。
+
+    比對用日期本身，不是「第幾週」：A 欄的日期由使用者自己維護，有幾年的
+    最後兩列並不是整齊的七天間隔。
+    """
+    try:
+        target = datetime.strptime(date_iso, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+    best_row, best_date = None, None
+    for r in range(WEEKLY_FIRST_ROW, WEEKLY_LAST_ROW + 1):
+        value = ws.cell(row=r, column=1).value
+        if not isinstance(value, datetime):
+            continue
+        d = value.date()
+        if d >= target and (best_date is None or d < best_date):
+            best_row, best_date = r, d
+    return best_row
+
+
+def _append_term_to_formula(cell, amount: float) -> str:
+    """把一筆金額接到 D／E 欄現有的公式後面，沿用使用者自己的記法：這兩格
+    平常長得像 `=23119+23019`，一筆交易就是一個加項，看得出當週是由哪幾筆
+    組成的。空格時寫成 `=金額`（不是純數字），跟使用者手寫的 `=24320`
+    一致；萬一原本是純數字（沒有等號），就把它接成公式的第一項。"""
+    term = _fmt_num(amount)
+    current = cell.value
+    if isinstance(current, str) and current.strip().startswith("="):
+        cell.value = current.rstrip() + f"+{term}"
+    elif isinstance(current, (int, float)):
+        cell.value = f"={_fmt_num(current)}+{term}"
+    else:
+        cell.value = f"={term}"
+    return cell.value
+
+
+def append_tx_to_xlsx(acc: str, date_iso: str, name: str, side: str,
+                      price: float, qty: float, amount: float) -> dict:
+    """「加入存摺」時把一筆交易同步寫進「菡萏咖啡.xlsx」的損益表：買進加進
+    D 欄、賣出加進 E 欄（都是該交易日對應的那一週），並在同一格的儲存格註解
+    附加一行「商品 單價*股數」，格式照使用者原本手寫的樣子。
+
+    寫的是價金（買進含手續費、賣出已扣手續費與交易稅），跟網頁的「當日買進／
+    當日賣出」同一個口徑；註解裡的 單價*股數 則是未扣費用的成交條件，所以
+    註解乘出來的數字會和公式的加項差一個費用——使用者自己記的那幾列也是
+    這樣（D47 `=23119+23019` 配上註解 `2310*10`／`2300*10`）。
+
+    acc 比照 adjust_balance 嚴格檢查，不把「不是 main」一律當成可橙。
+    """
+    if acc not in ("main", "keqiang"):
+        return {"ok": False, "error": f"不明的帳戶：{acc!r}"}
+    if side not in TX_SIDE_COL:
+        return {"ok": False, "error": f"不明的買賣別：{side!r}"}
+    name = _clean_note(name)
+    if not name:
+        return {"ok": False, "error": "商品名稱是空的"}
+    for label, v in (("價金", amount), ("單價", price), ("股數", qty)):
+        if not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
+            return {"ok": False, "error": f"{label}必須是大於 0 的數字"}
+
+    xlsx_path = BASE_DIR / XLSX_NAME
+    if not xlsx_path.exists():
+        return {"ok": False, "error": f"找不到 {XLSX_NAME}"}
+
+    try:
+        import openpyxl  # noqa: F401
+        from openpyxl.comments import Comment
+    except ImportError:
+        return {"ok": False, "error": "本機環境缺少 openpyxl 套件，無法寫入 xlsx"}
+
+    try:
+        year = int(date_iso.split("-")[0])
+    except (ValueError, IndexError, AttributeError):
+        return {"ok": False, "error": f"日期格式錯誤：{date_iso}"}
+    sheet_name = f"{year}損益表" if acc == "main" else f"{year}損益表 (可橙)"
+
+    try:
+        wb = _open_for_write(xlsx_path)
+    except PermissionError:
+        return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
+
+    if sheet_name not in wb.sheetnames:
+        return {"ok": False, "error": f"找不到分頁「{sheet_name}」"}
+    ws = wb[sheet_name]
+
+    row = _weekly_row_for_date(ws, date_iso)
+    if row is None:
+        return {"ok": False, "error": f"「{sheet_name}」裡找不到 {date_iso} 對應的週次（A 欄記帳日）"}
+
+    cell = ws[f"{TX_SIDE_COL[side]}{row}"]
+    formula = _append_term_to_formula(cell, amount)
+
+    comment_line = f"{name} {_fmt_num(price)}*{_fmt_num(qty)}"
+    try:
+        if cell.comment is not None and cell.comment.text:
+            cell.comment.text = cell.comment.text.rstrip("\n") + "\n" + comment_line
+        else:
+            cell.comment = Comment(comment_line, "菡萏咖啡存摺（自動）")
+    except Exception as exc:  # noqa: BLE001
+        # 註解寫不進去不該擋住金額本身，記一筆讓呼叫端顯示即可
+        print(f"[加入存摺] 寫入儲存格註解失敗（{type(exc).__name__}: {exc}）")
+        comment_line = ""
+
+    try:
+        wb.save(xlsx_path)
+    except PermissionError:
+        return {"ok": False, "error": f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，無法寫入，請先關閉後再試一次"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"儲存失敗：{type(exc).__name__}: {exc}"}
+
+    return {
+        "ok": True,
+        "sheet": sheet_name,
+        "cell": cell.coordinate,
+        "weekDate": ws.cell(row=row, column=1).value.strftime("%Y-%m-%d"),
+        "formula": formula,
+        "comment": comment_line,
+    }
+
+
 def read_xlsx_weekly() -> dict:
     """讀取「菡萏咖啡.xlsx」當年損益表 A4:I55 的每週記帳資料，取代網頁原本用
     PORTFOLIO_DATA 靜態資料＋JS 計算週績效的方式，改以 xlsx 為當年度的準。
@@ -2044,6 +2176,28 @@ class Handler(BaseHTTPRequestHandler):
                     acc=body.get("acc"),
                     delta=float(body.get("delta")),
                     note=body.get("note") or "",
+                )
+                self._send_json(200, result)
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                self._send_json(500, {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            return
+
+        if path == "/api/append-tx":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                result = append_tx_to_xlsx(
+                    acc=body.get("acc"),
+                    date_iso=body.get("date"),
+                    name=body.get("name"),
+                    side=body.get("side"),
+                    price=float(body.get("price")),
+                    qty=float(body.get("qty")),
+                    amount=float(body.get("amount")),
                 )
                 self._send_json(200, result)
             except Exception as exc:  # noqa: BLE001

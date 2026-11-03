@@ -653,6 +653,10 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
             <button class="btn" id="submitEntry">加入存摺</button>
             <span class="hint" id="addPreview"></span>
           </div>
+          <div class="btn-row" id="xlsxTxRow" style="margin-top:4px;">
+            <button class="btn ghost" id="retryXlsxTx" hidden></button>
+            <span class="hint" id="xlsxTxStatus"></span>
+          </div>
         </div>
 
         <div class="section-title"><span class="num">6</span>每日買賣總覽</div>
@@ -880,6 +884,7 @@ const state = {
   fieldOverride: { main: {}, keqiang: {} }, // {account: {stockId: {qty, avg_price, price}}}
   accountFinance: { main: {}, keqiang: {} }, // {account: {balance, cash, pendingDividend}} — 帳戶餘額／可用現金／未入帳配息手動覆寫值
   capitalFlows: { main: [], keqiang: [] }, // {account: [{date, amount, note}]} — 存入／提領，正為存入；用來同步調整股本基準，見 capitalFlowSince
+  pendingXlsxTx: [], // 加入存摺時沒寫進 菡萏咖啡.xlsx 的交易（通常是 Excel 開著），等使用者按「補寫到 Excel」，見 flushPendingXlsxTx
   yearCostBase: { main: {}, keqiang: {} }, // {account: {year: number}} — 使用者自填的「當年成本（年初庫存）」，當年績效的分母，見 yearCostBaseOf
   accountBalanceBaseline: { main: null, keqiang: null }, // 從 菡萏咖啡.xlsx 對應年度分頁 B2 讀到的基準值，每次連線 serve.py 才會有
   pendingDividendBaseline: { main: null, keqiang: null }, // 從 菡萏咖啡.xlsx 標示「(未入帳)」左邊的值讀到的基準值
@@ -941,6 +946,7 @@ function wellKnownKeyCandidates() {
     keys.push(`capital-flows:${acc}`);
     keys.push(`year-cost-base:${acc}`);
   });
+  keys.push('pending-xlsx-tx');
   return keys;
 }
 
@@ -4711,6 +4717,123 @@ function mergeTxIntoHoldings(acc, entry) {
   };
 }
 
+/* ---------------- 交易同步寫進 菡萏咖啡.xlsx ---------------- */
+// 「加入存摺」除了記在瀏覽器裡，還會把這筆交易寫進 菡萏咖啡.xlsx 損益表當週
+// 那一列：買進加到 D 欄、賣出加到 E 欄，並在同一格的註解附加一行
+// 「商品 單價*股數」，格式照使用者原本手寫的樣子（見 serve.py 的
+// append_tx_to_xlsx）。
+//
+// 寫入失敗最常見的原因是 Excel 正開著那個檔。失敗不回頭刪掉已經記好的交易
+// （跟「刪除交易不回沖持股明細」同一個原則），而是把這筆排進
+// state.pendingXlsxTx，讓使用者關掉 Excel 後按「補寫到 Excel」一次補完；
+// 佇列存進瀏覽器儲存，重新整理也不會掉。
+const PENDING_XLSX_TX_KEY = 'pending-xlsx-tx';
+
+async function loadPendingXlsxTx() {
+  try {
+    const res = await storageGet(PENDING_XLSX_TX_KEY, false);
+    if (res && res.value) state.pendingXlsxTx = JSON.parse(res.value) || [];
+  } catch (e) { /* not set yet */ }
+}
+
+async function savePendingXlsxTx() {
+  try {
+    await storageSet(PENDING_XLSX_TX_KEY, JSON.stringify(state.pendingXlsxTx || []), false);
+    await registerBackupKey(PENDING_XLSX_TX_KEY);
+  } catch (e) {
+    console.error('storage set failed', e);
+  }
+}
+
+// 只有透過 serve.py 開啟的電腦版寫得到 Excel。手機版（雲端唯讀）與直接開檔
+// 都沒有這個服務，也就不該把交易排進補寫佇列——那會變成永遠補不完的清單。
+function canWriteXlsx() {
+  return !window.__HANDAN_MOBILE__ && location.protocol.startsWith('http');
+}
+
+function xlsxTxPayload(acc, entry) {
+  return {
+    acc, date: entry.date, name: entry.name, side: entry.side,
+    price: entry.avgCost, qty: entry.qty, amount: entry.amount,
+  };
+}
+
+async function postTxToXlsx(payload) {
+  try {
+    const res = await fetch('/api/append-tx', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return await res.json();
+  } catch (e) {
+    return { ok: false, error: '無法連上本機服務' };
+  }
+}
+
+function setXlsxTxStatus(text, bad) {
+  const el = document.getElementById('xlsxTxStatus');
+  if (!el) return;
+  el.textContent = text || '';
+  el.style.color = bad ? 'var(--gain)' : '';
+}
+
+function renderPendingXlsxTx() {
+  const btn = document.getElementById('retryXlsxTx');
+  if (!btn) return;
+  const n = (state.pendingXlsxTx || []).length;
+  btn.hidden = n === 0;
+  btn.textContent = `補寫 ${n} 筆到 Excel`;
+}
+
+async function syncTxToXlsx(acc, entry) {
+  if (!canWriteXlsx()) {
+    setXlsxTxStatus(window.__HANDAN_MOBILE__
+      ? '手機版碰不到電腦上的 菡萏咖啡.xlsx，這筆只記在這支手機的瀏覽器裡。'
+      : '此頁未透過本機服務開啟，沒有同步 菡萏咖啡.xlsx。');
+    return;
+  }
+  const payload = xlsxTxPayload(acc, entry);
+  setXlsxTxStatus('寫入 Excel 中…');
+  const data = await postTxToXlsx(payload);
+  if (data && data.ok) {
+    setXlsxTxStatus(`已寫進 ${data.sheet} 的 ${data.cell}`
+      + (data.comment ? `，註解加上「${data.comment}」` : '（註解沒寫成功）'));
+    return;
+  }
+  state.pendingXlsxTx = [...(state.pendingXlsxTx || []), payload];
+  await savePendingXlsxTx();
+  renderPendingXlsxTx();
+  setXlsxTxStatus(`Excel 沒寫成功：${(data && data.error) || '未知錯誤'}`
+    + '。交易已記在網頁上，排進下面的補寫清單。', true);
+}
+
+async function flushPendingXlsxTx() {
+  const queue = [...(state.pendingXlsxTx || [])];
+  if (queue.length === 0) return;
+  const btn = document.getElementById('retryXlsxTx');
+  if (btn) btn.disabled = true;
+  setXlsxTxStatus(`補寫 ${queue.length} 筆到 Excel 中…`);
+  const left = [];
+  let done = 0, lastError = '';
+  for (let i = 0; i < queue.length; i++) {
+    const data = await postTxToXlsx(queue[i]);
+    if (data && data.ok) { done++; continue; }
+    lastError = (data && data.error) || '未知錯誤';
+    // 第一筆失敗通常是 Excel 還開著，後面必然也失敗，不必每筆都再開一次
+    // 活頁簿（一次要好幾秒）。剩下的原封不動留在佇列裡。
+    left.push(...queue.slice(i));
+    break;
+  }
+  state.pendingXlsxTx = left;
+  await savePendingXlsxTx();
+  renderPendingXlsxTx();
+  if (btn) btn.disabled = false;
+  setXlsxTxStatus(left.length === 0
+    ? `已補寫 ${done} 筆到 Excel。`
+    : `補寫了 ${done} 筆，還有 ${left.length} 筆沒寫成功：${lastError}`, left.length > 0);
+}
+
 /* ---------------- add entry form ---------------- */
 function populateAddYearSelect() {
   const sel = document.getElementById('addYear');
@@ -4806,6 +4929,10 @@ document.getElementById('submitEntry').addEventListener('click', async () => {
   renderStockTable();        // 庫存數量／平均單價／成本已經變了
   renderEtfTable();
   syncOverviewAfterHoldingsChange();
+
+  // Excel 放最後：寫入要重新載入整本活頁簿，好幾秒才回來，排在畫面更新後面
+  // 使用者才不用等它。失敗也不影響上面已經記好的這一筆。
+  await syncTxToXlsx(acc, entry);
 });
 
 const SIDE_LABEL = { buy: '買進', sell: '賣出' };
@@ -5057,6 +5184,12 @@ function renderAll() {
     console.error('loadYearCostBase failed:', e);
   }
   try {
+    await loadPendingXlsxTx();
+    renderPendingXlsxTx();
+  } catch (e) {
+    console.error('loadPendingXlsxTx failed:', e);
+  }
+  try {
     await loadConfirmedState();
   } catch (e) {
     console.error('loadConfirmedState failed:', e);
@@ -5115,6 +5248,11 @@ function renderAll() {
   const confirmBtn = document.getElementById('confirmHoldings');
   if (confirmBtn) {
     confirmBtn.addEventListener('click', confirmHoldingsForAccount);
+  }
+
+  const retryXlsxTxBtn = document.getElementById('retryXlsxTx');
+  if (retryXlsxTxBtn) {
+    retryXlsxTxBtn.addEventListener('click', flushPendingXlsxTx);
   }
 
   const cashAdjustBtn = document.getElementById('cashAdjustBtn');
