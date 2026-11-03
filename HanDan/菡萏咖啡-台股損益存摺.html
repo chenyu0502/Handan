@@ -4814,10 +4814,12 @@ function renderCustomTable() {
   const rows = [];
   for (const acc of ['main','keqiang']) {
     for (const y of Object.keys(state.customTransactions[acc])) {
-      (state.customTransactions[acc][y] || []).forEach((e, idx) => rows.push({ acc, year: y, idx, ...e }));
+      (state.customTransactions[acc][y] || []).forEach((e, idx) => rows.push({ acc, year: y, idx, seq: rows.length, ...e }));
     }
   }
-  rows.sort((a,b) => a.date.localeCompare(b.date));
+  // 由新到舊。同一天的再以新增順序倒過來排（seq 是蒐集時的順序），所以剛記的
+  // 那筆一定在最上面；idx 仍指向 state 裡的原位置，刪除不受排序影響。
+  rows.sort((a,b) => b.date.localeCompare(a.date) || b.seq - a.seq);
   const wrap = document.getElementById('customTableWrap');
   if (rows.length === 0) {
     wrap.innerHTML = '<div class="empty-note">目前還沒有手動新增的交易紀錄，填寫上方表單即可開始記帳。<\/div>';
@@ -4893,7 +4895,8 @@ function renderWeeklyTxSummary() {
       });
     }
   }
-  const rows = [...groups.values()].sort((a,b) => a.date.localeCompare(b.date));
+  // 由新到舊：最近的交易日排最上面，不必捲到底才看到今天的
+  const rows = [...groups.values()].sort((a,b) => b.date.localeCompare(a.date));
   const wrap = document.getElementById('weeklyTxSummaryWrap');
   if (rows.length === 0) {
     wrap.innerHTML = '<div class="empty-note">目前還沒有交易紀錄可加總。<\/div>';
