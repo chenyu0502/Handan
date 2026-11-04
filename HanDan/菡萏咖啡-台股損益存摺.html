@@ -2085,12 +2085,39 @@ function codeForName(name) {
   return STOCK_CODE_MAP[name] || null;
 }
 
+// 代號 → 中文名稱。「04 記一筆」的商品欄位填代號（2330）也能用，但這樣新增
+// 的持股列名稱就是代號本身，表上只看得到一串數字。顯示時反查回中文名。
+// 同一個代號有多個名稱時（例如 2883 同時有「凱基金」與舊名「開發金」）取
+// 對照表裡先出現的那個——那是目前的名稱。表是在登入後才注入的（雲端版），
+// 所以延後到第一次用到時才建，不在載入時就算。
+let _nameByCode = null;
+function nameByCode(code) {
+  if (!_nameByCode) {
+    _nameByCode = {};
+    for (const [n, c] of Object.entries(STOCK_CODE_MAP)) {
+      if (!(c in _nameByCode)) _nameByCode[c] = n;
+    }
+  }
+  return _nameByCode[code] || null;
+}
+
+// 存進基準值用的名稱：填代號建立的列改存中文名（查得到的話）。純粹是可讀性
+// ——比對一律走代號（sameProductAs），存哪一種都對得到同一檔。
+function canonicalName(name) {
+  const code = codeForName(name);
+  return (code === name && nameByCode(code)) || name;
+}
+
 // 表格上把股票代號跟在名稱後面顯示，對照券商軟體時比較好找。
-// ETF 的名稱本身就是代號（0056、00878…），不重複顯示；已賣出的舊部位
-// 可能不在 STOCK_CODE_MAP 內，查不到就只顯示名稱。
+// ETF 的名稱本身就是代號（0056、00878…），對照表裡沒有它們，反查不到就維持
+// 只顯示代號；已賣出的舊部位可能不在 STOCK_CODE_MAP 內，一樣只顯示名稱。
 function nameWithCode(name) {
   const code = codeForName(name);
-  if (!code || code === name) return name;
+  if (!code) return name;
+  if (code === name) {
+    const zh = nameByCode(code);
+    return zh ? `${zh}<span class="stock-code">${code}<\/span>` : name;
+  }
   return `${name}<span class="stock-code">${code}<\/span>`;
 }
 
@@ -2825,9 +2852,12 @@ async function confirmHoldingsForAccount() {
   //    已賣出的列直接不放進新基準值。這不會影響總覽數字：這一輪的差額已在
   //    步驟 1 併進 confirmedDelta，而已賣出列在基準值裡本來就不貢獻任何
   //    成本／市值（computeLiveDelta 對 sold 列兩邊都取 0），留著或刪掉結果相同。
+  // 順便把「名稱就是代號」的舊列改存中文名（canonicalName）：那些列是在
+  // 「04 記一筆」填代號時建的，表上看得到中文是靠顯示時反查，但匯出的 Excel
+  // 會只剩數字。比對走代號，改名不影響任何對帳。
   const baked = baseStocks(acc)
     .filter(r => !effectiveSold(acc, r))
-    .map(r => ({ ...effectiveStock(acc, r), sold: false, edited: false }));
+    .map(r => ({ ...effectiveStock(acc, r), name: canonicalName(r.name), sold: false, edited: false }));
   state.confirmedStocks[acc] = baked;
 
   // 3) clear the working overrides -- they're now part of the baseline
@@ -4695,12 +4725,13 @@ function mergeTxIntoHoldings(acc, entry) {
     // 買進全新商品：補一列 0 股的基準列，實際股數與成本走 fieldOverride
     const code = codeForName(entry.name);
     const isEtf = !!(code && /^00/.test(code));
+    const rowName = canonicalName(entry.name);
     const id = nextStockId(acc);
     if (!state.confirmedStocks[acc]) {
       state.confirmedStocks[acc] = (baseStocks(acc) || []).map(s => ({ ...s }));
     }
     state.confirmedStocks[acc].push({
-      name: entry.name, qty: 0, avg_price: 0, cost: 0,
+      name: rowName, qty: 0, avg_price: 0, cost: 0,
       price: entry.avgCost, value: 0, pnl: 0, perf: 0,
       sold: false, type: isEtf ? 'etf' : 'stock', id, edited: false,
     });
@@ -4708,7 +4739,7 @@ function mergeTxIntoHoldings(acc, entry) {
     const untracked = !STOCK_CODE_MAP[entry.name] && !/^\d/.test(entry.name);
     return {
       ok: true, created: true, id,
-      msg: `已在${ACC_LABEL[acc]}的持股明細新增「${entry.name}」${fmtInt(entry.qty)} 股，平均單價 ${entry.avgCost}。`
+      msg: `已在${ACC_LABEL[acc]}的持股明細新增「${rowName}」${fmtInt(entry.qty)} 股，平均單價 ${entry.avgCost}。`
         + (untracked ? '　這檔還沒收錄在代號對照表裡，取盤後收盤價時抓不到現價。' : ''),
     };
   }
