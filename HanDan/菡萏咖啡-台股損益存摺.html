@@ -495,10 +495,21 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
 .edited-dot{color:var(--gold);font-size:9px;margin-left:5px;vertical-align:middle;}
 .stock-code{margin-left:6px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ink-soft);font-weight:500;letter-spacing:.02em;}
 .excluded-dot{color:var(--gain);font-size:11px;margin-left:5px;vertical-align:middle;}
-/* 持股明細每列的小按鈕：「暫停／恢復」與「還原」同尺寸 */
-.btn.ghost.calc-exclude-toggle,
-.btn.ghost.reset-fields{padding:5px 10px;font-size:11.5px;}
-.btn.ghost.reset-fields{margin-left:6px;}
+/* 持股明細每列的「狀態」選單：暫停／還原／刪除三個動作收在這裡。第一個
+   選項顯示目前狀態，選了動作就執行，之後重繪會跳回狀態那一項。 */
+select.row-action{
+  border:1px solid var(--paper-line);
+  background:#fff;
+  border-radius:8px;
+  padding:4px 6px;
+  font-size:11.5px;
+  color:var(--ink-soft);
+  font-family:'Noto Sans TC',sans-serif;
+  cursor:pointer;
+  max-width:120px;
+}
+/* 暫停計算中的列用警示色，跟列本身的淡化一起提示 */
+select.row-action.is-excluded{color:var(--gain);border-color:var(--gain);}
 .confirm-bar{
   margin-top:18px;padding:16px 18px;background:rgba(201,160,43,0.06);
   border:1px solid rgba(201,160,43,0.3);border-radius:12px;
@@ -584,7 +595,7 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
             <button class="btn" id="confirmHoldings">確認並存檔（目前帳戶）</button>
             <span class="hint" id="confirmStatus"></span>
           </div>
-          <p class="hint" style="margin-top:8px;">按下後，目前帳戶所有修改會變成新的基準值（「還原」按鈕會跟著消失），並會下載一份反映最新持股的 Excel，你可以用它取代或合併回「菡萏咖啡.xlsx」，下次請我更新網頁時也能從這份新檔案繼續。</p>
+          <p class="hint" style="margin-top:8px;">按下後，目前帳戶所有修改會變成新的基準值（狀態選單裡的「還原為原始數值」會跟著消失），並會下載一份反映最新持股的 Excel，你可以用它取代或合併回「菡萏咖啡.xlsx」，下次請我更新網頁時也能從這份新檔案繼續。</p>
         </div>
       </div>
 
@@ -2644,56 +2655,56 @@ function renderStockTable() {
       <td class="${pnlClass(r.pnl)}">${fmtMoney(r.pnl)}<\/td>
       <td class="${pnlClass(r.perf)}">${fmtPct(r.perf)}<\/td>
       <td>
-        <button class="btn ghost calc-exclude-toggle" data-id="${r.id}" title="${excluded ? '恢復列入計算：重新計入成本／市值／損益合計' : '暫停列入計算：不影響顯示，只是不計入成本／市值／損益合計'}">${excluded ? '恢復' : '暫停'}<\/button>
-        ${r.edited ? `<button class="btn ghost reset-fields" data-id="${r.id}" title="還原為原始數值">還原<\/button>` : ''}
-        <button class="btn ghost delete-row" data-id="${r.id}" title="整列刪除：記錯或測試留下的列才用這個；真的賣出請到「04 記一筆」">刪除<\/button>
+        <select class="row-action${excluded ? ' is-excluded' : ''}" data-id="${r.id}" title="對這一列的操作">
+          <option value="" selected>${excluded ? '暫停計算中' : (r.edited ? '已修改' : '持有中')}<\/option>
+          <option value="exclude">${excluded ? '恢復列入計算' : '暫停列入計算'}<\/option>
+          ${r.edited ? '<option value="reset">還原為原始數值<\/option>' : ''}
+          <option value="delete">刪除這一列<\/option>
+        <\/select>
       <\/td>
     <\/tr>`;
   }).join('')}<\/tbody>`;
   document.getElementById('stockTable').innerHTML = thead + tbody;
   bindSortHandlers('stock', renderStockTable);
   bindEditableCells(acc);
-  document.querySelectorAll('.calc-exclude-toggle').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const id = btn.dataset.id;
-      const current = !!state.calcExcluded[acc][id];
-      if (current) {
-        delete state.calcExcluded[acc][id];
+  // 「狀態」欄的下拉選單：暫停／恢復、還原、刪除都從這裡選。選完一律重繪，
+  // 選單會跟著跳回第一項（目前狀態）；中途取消（例如刪除時按了取消）要自己
+  // 把選單撥回去，否則畫面會停在沒有真的執行的那個動作上。
+  //
+  // 刪除是整列移除，給「記錯了」「測試留下的列」用的：刪掉 04 記一筆的交易
+  // 紀錄不會把持股明細改回去（那筆已經併進庫存了），而「記一筆賣出歸零」
+  // 會連帶寫進 Excel 的 D／E 欄與帳戶餘額，對一列本來就不該存在的資料是錯的。
+  // 走的是跟賣光同一條路（soldOverride → 立刻隱藏、成本與市值歸零、下次
+  // 「確認並存檔」從基準值移除，那次會先自動下載刪除前的備份）。
+  document.querySelectorAll('select.row-action').forEach(sel => {
+    sel.addEventListener('change', async () => {
+      const action = sel.value;
+      const id = sel.dataset.id;
+      sel.value = '';
+      if (action === 'exclude') {
+        if (state.calcExcluded[acc][id]) {
+          delete state.calcExcluded[acc][id];
+        } else {
+          state.calcExcluded[acc][id] = true;
+        }
+        await saveCalcExcluded(acc);
+      } else if (action === 'reset') {
+        delete state.fieldOverride[acc][id];
+        await saveFieldOverrides(acc);
+      } else if (action === 'delete') {
+        const row = rows.find(r => r.id === id);
+        const label = row ? `${row.name}（${fmtInt(row.qty)} 股）` : id;
+        const ok = confirm(`要把${ACC_LABEL[acc]}的「${label}」整列從持股明細刪除嗎？\n\n`
+          + '這是給記錯、測試留下的列用的，不是賣出。真的賣掉請到「04 記一筆」記一筆賣出，'
+          + '才會同步寫進 Excel 並調整帳戶餘額。\n\n'
+          + '刪除後這一列的成本與市值立刻不再計入總覽；按「確認並存檔」才正式從基準值移除，'
+          + '那時會先自動下載一份刪除前的備份。');
+        if (!ok) return;
+        state.soldOverride[acc][id] = true;
+        await saveSoldOverrides(acc);
       } else {
-        state.calcExcluded[acc][id] = true;
+        return;
       }
-      await saveCalcExcluded(acc);
-      renderStockTable();
-      syncOverviewAfterHoldingsChange();
-    });
-  });
-  document.querySelectorAll('.reset-fields').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const id = btn.dataset.id;
-      delete state.fieldOverride[acc][id];
-      await saveFieldOverrides(acc);
-      renderStockTable();
-      syncOverviewAfterHoldingsChange();
-    });
-  });
-  // 整列刪除：給「記錯了」「測試留下的列」用的。刪除交易紀錄不會把持股明細
-  // 改回去（那筆已經併進庫存了），在這之前只能靠「記一筆賣出歸零」間接清掉，
-  // 但那會連帶寫進 Excel 的 D／E 欄與帳戶餘額，對一列本來就不該存在的資料是
-  // 錯的。走的是跟賣光同一條路（soldOverride → 立刻隱藏、成本與市值歸零、
-  // 下次「確認並存檔」從基準值移除，那次會先自動下載刪除前的備份）。
-  document.querySelectorAll('.delete-row').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const id = btn.dataset.id;
-      const row = rows.find(r => r.id === id);
-      const label = row ? `${row.name}（${fmtInt(row.qty)} 股）` : id;
-      const ok = confirm(`要把${ACC_LABEL[acc]}的「${label}」整列從持股明細刪除嗎？\n\n`
-        + '這是給記錯、測試留下的列用的，不是賣出。真的賣掉請到「04 記一筆」記一筆賣出，'
-        + '才會同步寫進 Excel 並調整帳戶餘額。\n\n'
-        + '刪除後這一列的成本與市值立刻不再計入總覽；按「確認並存檔」才正式從基準值移除，'
-        + '那時會先自動下載一份刪除前的備份。');
-      if (!ok) return;
-      state.soldOverride[acc][id] = true;
-      await saveSoldOverrides(acc);
       renderStockTable();
       syncOverviewAfterHoldingsChange();
     });
