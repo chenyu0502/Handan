@@ -568,7 +568,7 @@ tr.etf-totals-row{background:rgba(34,49,79,0.04);border-top:2px solid var(--pape
       <!-- ===== PANEL: HOLDINGS ===== -->
       <div class="panel" id="panel-holdings">
         <div class="section-title"><span class="num">3</span>持股明細（2026）</div>
-        <p class="section-desc">現股個股與存股 ETF 合併列示，只列目前持有的商品；已賣出的商品不再保留，賣出請在「04 記一筆」操作。點擊「庫存數量」「平均單價」「現價」欄位可直接修改數值，成本／市值／損益會自動重新計算。</p>
+        <p class="section-desc">現股個股與存股 ETF 合併列示，只列目前持有的商品；已賣出的商品不再保留，賣出請在「04 記一筆」操作。點擊「庫存數量」「平均單價」「現價」欄位可直接修改數值，成本／市值／損益會自動重新計算。記錯或測試留下的列，用該列的「刪除」整列移除（那不是賣出，不會動到 Excel 與帳戶餘額）。</p>
         <div class="control-row">
           <div class="seg" id="accSegHoldings"></div>
           <div class="seg" id="typeFilterSeg"></div>
@@ -2569,7 +2569,7 @@ function renderStockSummary() {
   // 已賣出的列不顯示，按「確認並存檔」時刪除；還沒確認前在這裡提示筆數，
   // 讓人知道有東西等著被刪（例如剛在「04 記一筆」賣光的那一檔）
   if (el) el.textContent = `持有中 ${held.length} 檔（股票 ${heldStock}／ETF ${heldEtf}）`
-    + (sold.length ? `　·　已賣出 ${sold.length} 檔，按「確認並存檔」後刪除` : '');
+    + (sold.length ? `　·　待刪除 ${sold.length} 檔（已賣出或手動刪除），按「確認並存檔」後移除` : '');
 }
 
 function renderStockTotals(rows, acc) {
@@ -2646,6 +2646,7 @@ function renderStockTable() {
       <td>
         <button class="btn ghost calc-exclude-toggle" data-id="${r.id}" title="${excluded ? '恢復列入計算：重新計入成本／市值／損益合計' : '暫停列入計算：不影響顯示，只是不計入成本／市值／損益合計'}">${excluded ? '恢復' : '暫停'}<\/button>
         ${r.edited ? `<button class="btn ghost reset-fields" data-id="${r.id}" title="還原為原始數值">還原<\/button>` : ''}
+        <button class="btn ghost delete-row" data-id="${r.id}" title="整列刪除：記錯或測試留下的列才用這個；真的賣出請到「04 記一筆」">刪除<\/button>
       <\/td>
     <\/tr>`;
   }).join('')}<\/tbody>`;
@@ -2671,6 +2672,28 @@ function renderStockTable() {
       const id = btn.dataset.id;
       delete state.fieldOverride[acc][id];
       await saveFieldOverrides(acc);
+      renderStockTable();
+      syncOverviewAfterHoldingsChange();
+    });
+  });
+  // 整列刪除：給「記錯了」「測試留下的列」用的。刪除交易紀錄不會把持股明細
+  // 改回去（那筆已經併進庫存了），在這之前只能靠「記一筆賣出歸零」間接清掉，
+  // 但那會連帶寫進 Excel 的 D／E 欄與帳戶餘額，對一列本來就不該存在的資料是
+  // 錯的。走的是跟賣光同一條路（soldOverride → 立刻隱藏、成本與市值歸零、
+  // 下次「確認並存檔」從基準值移除，那次會先自動下載刪除前的備份）。
+  document.querySelectorAll('.delete-row').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.id;
+      const row = rows.find(r => r.id === id);
+      const label = row ? `${row.name}（${fmtInt(row.qty)} 股）` : id;
+      const ok = confirm(`要把${ACC_LABEL[acc]}的「${label}」整列從持股明細刪除嗎？\n\n`
+        + '這是給記錯、測試留下的列用的，不是賣出。真的賣掉請到「04 記一筆」記一筆賣出，'
+        + '才會同步寫進 Excel 並調整帳戶餘額。\n\n'
+        + '刪除後這一列的成本與市值立刻不再計入總覽；按「確認並存檔」才正式從基準值移除，'
+        + '那時會先自動下載一份刪除前的備份。');
+      if (!ok) return;
+      state.soldOverride[acc][id] = true;
+      await saveSoldOverrides(acc);
       renderStockTable();
       syncOverviewAfterHoldingsChange();
     });
