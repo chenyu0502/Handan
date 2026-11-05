@@ -296,7 +296,6 @@ def update_xlsx_prices(prices: dict) -> dict:
 
     year = datetime.now().year
     sheet_names = [f"{year}損益表", f"{year}損益表 (可橙)"]
-    name_to_code = dict(fc.STOCK_CODE_MAP)
 
     updated = 0
     missing_sheets = []
@@ -306,10 +305,7 @@ def update_xlsx_prices(prices: dict) -> dict:
             continue
         ws = wb[sheet_name]
         for r in range(57, ws.max_row + 1):
-            name = ws.cell(row=r, column=1).value
-            if name is None:
-                continue
-            code = name_to_code.get(str(name).strip(), str(name).strip())
+            code = holding_code(ws.cell(row=r, column=1).value)
             if code in prices:
                 ws.cell(row=r, column=5).value = prices[code]
                 updated += 1
@@ -944,7 +940,6 @@ def read_xlsx_prices() -> dict:
 
     year = datetime.now().year
     sheet_names = [f"{year}損益表", f"{year}損益表 (可橙)"]
-    name_to_code = dict(fc.STOCK_CODE_MAP)
     wanted = set(fc.ETF_CODES) | set(fc.STOCK_CODE_MAP.values())
 
     prices: dict[str, float] = {}
@@ -953,10 +948,7 @@ def read_xlsx_prices() -> dict:
             continue
         ws = wb[sheet_name]
         for r in range(57, ws.max_row + 1):
-            name = ws.cell(row=r, column=1).value
-            if name is None:
-                continue
-            code = name_to_code.get(str(name).strip(), str(name).strip())
+            code = holding_code(ws.cell(row=r, column=1).value)
             if code not in wanted:
                 continue
             price = ws.cell(row=r, column=5).value
@@ -1432,6 +1424,257 @@ def _append_term_to_formula(cell, amount: float) -> str:
     return cell.value
 
 
+# 損益表下半部的持股表格區：第 57 列起（週記帳表下方），每一列 A=商品、
+# B=庫存數量、C=平均單價、D=成本金額、E=現價，一直到商品名稱為 Sample 的
+# 範本列為止。Sample 是整張分頁的最後一列，它下面是空的，也不在任何
+# `=SUM(...)` 的範圍裡——新增與下架的列都堆在那裡，見 _staging_row()。
+HOLDING_FIRST_ROW = 57
+HOLDING_LAST_COL = 12  # A~L，複製整列時的範圍
+SAMPLE_NAME = "Sample"
+LENDING_MARK = "借券(出借)"
+HC_NAME, HC_QTY, HC_AVG, HC_COST, HC_PRICE = 1, 2, 3, 4, 5
+
+# 「台積電 2330」這種「中文+代號」的寫法（_display_name_with_code 產生的）
+_CODE_TAIL = re.compile(r"^(?P<zh>.*?)[\s　]*(?P<code>[0-9]{4,6}[A-Z]?)$")
+
+
+def holding_code(raw) -> str:
+    """把持股列 A 欄的商品名稱換算成代號，給比對用。
+
+    對照表 fc.STOCK_CODE_MAP 是單向的（名稱 → 代號），ETF 本來就以代號為名，
+    兩者都原樣處理。另外吃「中文+代號」的寫法：`_sync_holding_row()` 新增
+    的列就是這樣填的（使用者要求），不認得它的話那一列永遠抓不到現價。
+    """
+    name = str(raw).strip() if raw is not None else ""
+    if not name:
+        return ""
+    code = fc.STOCK_CODE_MAP.get(name)
+    if code:
+        return code
+    m = _CODE_TAIL.match(name)
+    if m and m.group("zh"):
+        return m.group("code")
+    return name
+
+
+def _display_name_with_code(name: str) -> str:
+    """新增持股列時 A 欄要填的名稱：中文後面接代號（使用者指定的格式）。
+    ETF 以代號為名、不在對照表裡，維持原樣。"""
+    code = fc.STOCK_CODE_MAP.get(name)
+    return f"{name} {code}" if code and code != name else name
+
+
+def _find_sample_row(ws) -> int | None:
+    """找商品名稱為 Sample 的範本列。找不到就不動持股表——寧可少做，
+    也不要憑列號猜範圍（使用者會在 Excel 裡插入／刪除持股列）。"""
+    for r in range(HOLDING_FIRST_ROW, ws.max_row + 1):
+        v = ws.cell(row=r, column=HC_NAME).value
+        if isinstance(v, str) and v.strip().lower() == SAMPLE_NAME.lower():
+            return r
+    return None
+
+
+def _holding_rows(ws, sample_row: int) -> list[int]:
+    """持股表格區裡「真正的持股列」的列號。
+
+    要排除三種列：表頭（B 欄是「庫存數量」這種文字，不是數字也不是公式）、
+    小計／空白列（A 欄空白），以及「借券(出借)」子表——那裡面的商品跟上面
+    的現股同名（0056 同時出現在 95 與 114 列），買進加到出借的那一列是錯的。
+    借券區從 A 欄寫著「借券(出借)」的那一列開始，到下一個空白 A 欄（也就是
+    那個區塊的小計列）為止。
+    """
+    rows, lending = [], False
+    for r in range(HOLDING_FIRST_ROW, sample_row):
+        raw = ws.cell(row=r, column=HC_NAME).value
+        name = str(raw).strip() if raw is not None else ""
+        if not name:
+            lending = False
+            continue
+        if name == LENDING_MARK:
+            lending = True
+            continue
+        qty_raw = ws.cell(row=r, column=HC_QTY).value
+        if isinstance(qty_raw, str) and not qty_raw.lstrip().startswith("="):
+            lending = False  # 表頭列；B 欄是公式（`=3418+140`）的才是持股
+            continue
+        if lending:
+            continue
+        rows.append(r)
+    return rows
+
+
+def _staging_row(ws, sample_row: int) -> int:
+    """Sample 下面第一個完全空白的列。
+
+    新增的持股列與下架的持股列都放這裡，不用 insert_rows()／delete_rows()：
+    openpyxl 搬動儲存格時**不會**跟著修正公式，而這張分頁滿是跨列的絕對
+    參照（`=$F$138+$E$2+$L$136-$C$2`、`=SUM(D95:D111)+SUM(D121:D134)`），
+    連「總績效」分頁都直接指名 `='2026損益表'!$C$55`。中間插一列或刪一列，
+    這些公式會全部指到錯的位置而且不會報錯。Sample 以下沒有任何公式涵蓋，
+    是唯一能安全長出新列的地方。
+    """
+    r = sample_row + 1
+    while r <= ws.max_row and any(
+        ws.cell(row=r, column=c).value is not None for c in range(1, HOLDING_LAST_COL + 1)
+    ):
+        r += 1
+    return r
+
+
+def _copy_holding_row(ws, src_row: int, dst_row: int) -> None:
+    """整列複製（含格式）。公式用 openpyxl 的 Translator 平移列號，
+    Sample 的 `=B141*C141` 到了 142 列才會是 `=B142*C142`；絕對參照
+    （`=D141/$D$139` 的 $D$139）照 Excel 的規則留在原處。"""
+    from copy import copy as _copy
+    from openpyxl.formula.translate import Translator
+
+    for c in range(1, HOLDING_LAST_COL + 1):
+        src = ws.cell(row=src_row, column=c)
+        dst = ws.cell(row=dst_row, column=c)
+        value = src.value
+        if isinstance(value, str) and value.startswith("="):
+            try:
+                value = Translator(value, origin=src.coordinate).translate_formula(dst.coordinate)
+            except Exception:  # noqa: BLE001
+                pass  # 平移失敗就原樣帶過去，看得到也改得動，比整個失敗好
+        dst.value = value
+        try:
+            dst._style = _copy(src._style)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _clear_holding_row(ws, row: int) -> None:
+    """清空一列的 A~L（保留格式）。這是「整列刪除」的替代做法：真的
+    delete_rows() 會讓下面每一列往上移，而公式不會跟著修正（見
+    _staging_row），整本活頁簿會靜默算錯。清空後這一列的成本與市值都是 0，
+    對總計的影響跟刪掉一樣，空殼留在原地由使用者在 Excel 裡刪（Excel 刪列
+    會自己修公式）。"""
+    for c in range(1, HOLDING_LAST_COL + 1):
+        cell = ws.cell(row=row, column=c)
+        cell.value = None
+        try:
+            if cell.comment is not None:
+                cell.comment = None
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _write_holding_qty(cell, delta: float, total: float) -> None:
+    """庫存數量：原本是公式（ETF 那幾列長得像 `=3418+140+135`，一次加碼
+    就是一個加項）就接一項上去，沿用使用者的記法；原本是純數字就寫新的
+    總量。"""
+    current = cell.value
+    if isinstance(current, str) and current.lstrip().startswith("="):
+        sign = "+" if delta >= 0 else "-"
+        cell.value = current.rstrip() + f"{sign}{_fmt_num(abs(delta))}"
+    else:
+        cell.value = total
+
+
+def _sync_holding_row(ws, ws_cached, ws_raw, name: str, side: str,
+                      price: float, qty: float, amount: float) -> dict:
+    """「加入存摺」時同步維護損益表下半部的持股表。
+
+    買進：該商品已有持股列 → 庫存數量累加、平均單價重算成
+    （原成本金額＋價金）÷ 新總股數；沒有 → 複製 Sample 範本列到它下面，
+    填上「中文 代號」、股數與 價金÷股數。
+    賣出：扣掉之後還有庫存 → 庫存數量相減、平均單價重算成
+    （原成本金額－價金）÷ 剩餘股數；歸零（或超賣）→ 先把那一列複製到
+    Sample 下面留底，再把原本那一列清空。
+
+    **同名多列時不自動合併。** 使用者刻意把同一檔的不同批次分開記（品安
+    在我的戶頭就有 4 列、00937B 在可橙有 3 列），猜錯一列會改到真實部位。
+    買進改成在 Sample 下面開一列待使用者自己歸位，賣出則整個跳過並回報。
+
+    平均單價照使用者指定的公式算，不是「維持原均價、把損益結算掉」那種
+    算法：賣出時實現的賺賠會被攤進剩餘部位的成本，賣得比成本高很多時
+    算出來的均價可能是負數，那是公式本身的結果，不是出錯。
+    """
+    sample_row = _find_sample_row(ws)
+    if sample_row is None:
+        return {"ok": False, "error": f"「{ws.title}」裡找不到商品名稱為「{SAMPLE_NAME}」的範本列，沒有動持股表"}
+
+    want = holding_code(name)
+    matches = [r for r in _holding_rows(ws, sample_row)
+               if holding_code(ws.cell(row=r, column=HC_NAME).value) == want]
+
+    def cellnum(coord: str):
+        return xlsx_cell(ws_cached, ws_raw, coord)
+
+    def read_row(r: int):
+        old_qty, old_avg = cellnum(f"B{r}"), cellnum(f"C{r}")
+        if old_qty is None or old_avg is None:
+            return None, None, None
+        old_cost = cellnum(f"D{r}")
+        if old_cost is None:
+            old_cost = old_qty * old_avg  # D 多半是 `=B*C`，但 D91 是 `=8000*C91`
+        return old_qty, old_avg, old_cost
+
+    def new_row_from_sample() -> dict:
+        dst = _staging_row(ws, sample_row)
+        _copy_holding_row(ws, sample_row, dst)
+        ws.cell(row=dst, column=HC_NAME).value = _display_name_with_code(name)
+        ws.cell(row=dst, column=HC_QTY).value = qty
+        ws.cell(row=dst, column=HC_AVG).value = round(amount / qty, 4)
+        # 現價先放成交單價，損益才會從 0 起算；下次「取得盤後收盤價」會蓋掉。
+        ws.cell(row=dst, column=HC_PRICE).value = price
+        return {
+            "ok": True, "action": "new", "row": dst, "sheet": ws.title,
+            "name": ws.cell(row=dst, column=HC_NAME).value,
+            "qty": qty, "avg": round(amount / qty, 4),
+            "sampleRow": sample_row,
+        }
+
+    if side == "buy":
+        if len(matches) != 1:
+            result = new_row_from_sample()
+            if matches:
+                result["note"] = f"「{name}」在這張分頁有 {len(matches)} 列（第 {'、'.join(str(r) for r in matches)} 列），沒有自動合併"
+            return result
+        row = matches[0]
+        old_qty, old_avg, old_cost = read_row(row)
+        if old_qty is None:
+            return {"ok": False, "error": f"讀不到 {ws.title}!B{row}／C{row} 目前的庫存數量或平均單價，沒有動這一列"}
+        total = old_qty + qty
+        if total <= 0:
+            return {"ok": False, "error": f"{ws.title}!B{row} 累加後不是正數（{_fmt_num(total)}），沒有動這一列"}
+        avg = round((old_cost + amount) / total, 4)
+        _write_holding_qty(ws.cell(row=row, column=HC_QTY), qty, total)
+        ws.cell(row=row, column=HC_AVG).value = avg
+        return {"ok": True, "action": "merge", "row": row, "sheet": ws.title,
+                "name": str(ws.cell(row=row, column=HC_NAME).value).strip(),
+                "qty": total, "avg": avg}
+
+    # 賣出
+    if len(matches) != 1:
+        if matches:
+            return {"ok": False, "error": f"「{name}」在「{ws.title}」有 {len(matches)} 列（第 {'、'.join(str(r) for r in matches)} 列），不確定要扣哪一批，沒有動持股表"}
+        return {"ok": False, "error": f"「{ws.title}」的持股表裡找不到「{name}」，沒有動持股表"}
+
+    row = matches[0]
+    old_qty, old_avg, old_cost = read_row(row)
+    if old_qty is None:
+        return {"ok": False, "error": f"讀不到 {ws.title}!B{row}／C{row} 目前的庫存數量或平均單價，沒有動這一列"}
+    remain = old_qty - qty
+    row_name = str(ws.cell(row=row, column=HC_NAME).value).strip()
+    if remain > 0:
+        avg = round((old_cost - amount) / remain, 4)
+        _write_holding_qty(ws.cell(row=row, column=HC_QTY), -qty, remain)
+        ws.cell(row=row, column=HC_AVG).value = avg
+        return {"ok": True, "action": "reduce", "row": row, "sheet": ws.title,
+                "name": row_name, "qty": remain, "avg": avg}
+
+    dst = _staging_row(ws, sample_row)
+    _copy_holding_row(ws, row, dst)
+    _clear_holding_row(ws, row)
+    result = {"ok": True, "action": "close", "row": row, "sheet": ws.title,
+              "name": row_name, "copiedTo": dst, "sampleRow": sample_row}
+    if remain < 0:
+        result["note"] = f"賣出 {_fmt_num(qty)} 股比庫存 {_fmt_num(old_qty)} 股還多，仍視為出清"
+    return result
+
+
 def append_tx_to_xlsx(acc: str, date_iso: str, name: str, side: str,
                       price: float, qty: float, amount: float) -> dict:
     """「加入存摺」時把一筆交易同步寫進「菡萏咖啡.xlsx」的損益表：買進加進
@@ -1501,6 +1744,28 @@ def append_tx_to_xlsx(acc: str, date_iso: str, name: str, side: str,
         print(f"[加入存摺] 寫入儲存格註解失敗（{type(exc).__name__}: {exc}）")
         comment_line = ""
 
+    # 同一本活頁簿、同一次存檔裡順便維護下半部的持股表。讀舊的庫存數量／
+    # 平均單價要走 xlsx_cell() 的那套退路（寫入過的檔案公式快取是空的），
+    # 所以借用 read_books() 的唯讀活頁簿對——_open_for_write() 已經載過，
+    # 這裡是快取命中。持股表出錯不該擋住 D／E 欄那筆已經記好的金額，
+    # 失敗只回報，不中斷。
+    holding = None
+    try:
+        wb_cached, wb_raw, books_err = read_books()
+        if books_err:
+            holding = {"ok": False, "error": books_err.get("error", "讀不到活頁簿")}
+        else:
+            holding = _sync_holding_row(
+                ws,
+                wb_cached[sheet_name] if sheet_name in wb_cached.sheetnames else None,
+                wb_raw[sheet_name] if sheet_name in wb_raw.sheetnames else None,
+                name, side, price, qty, amount,
+            )
+    except Exception as exc:  # noqa: BLE001
+        holding = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if not holding.get("ok"):
+        print(f"[加入存摺] 持股表沒有同步：{holding.get('error')}")
+
     try:
         wb.save(xlsx_path)
     except PermissionError:
@@ -1515,6 +1780,7 @@ def append_tx_to_xlsx(acc: str, date_iso: str, name: str, side: str,
         "weekDate": ws.cell(row=row, column=1).value.strftime("%Y-%m-%d"),
         "formula": formula,
         "comment": comment_line,
+        "holding": holding,
     }
 
 

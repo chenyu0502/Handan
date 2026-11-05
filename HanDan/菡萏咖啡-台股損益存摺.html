@@ -4818,7 +4818,9 @@ function canWriteXlsx() {
 
 function xlsxTxPayload(acc, entry) {
   return {
-    acc, date: entry.date, name: entry.name, side: entry.side,
+    // 名稱換成中文（填代號時 canonicalName 會反查）：儲存格註解與新增的持股
+    // 列都用這個名字，寫「2330 2300*10」跟使用者自己手寫的那幾行不一致。
+    acc, date: entry.date, name: canonicalName(entry.name), side: entry.side,
     price: entry.avgCost, qty: entry.qty, amount: entry.amount,
   };
 }
@@ -4843,6 +4845,26 @@ function setXlsxTxStatus(text, bad) {
   el.style.color = bad ? 'var(--gain)' : '';
 }
 
+// 持股表同步的結果（append_tx_to_xlsx 回傳的 holding）翻成一句話。寫得具體
+// 一點：新增與出清的列都堆在 Sample 下面，使用者得知道去哪裡把它歸位。
+function holdingNote(h) {
+  if (!h) return '';
+  if (!h.ok) return `　持股表沒同步：${h.error || '未知原因'}`;
+  const where = `${h.sheet} 第 ${h.row} 列`;
+  // 附註一律擺句尾，不要插在句子中間——多列同名那段本身就有括號，夾在
+  // 中間會變成括號裡又一層括號。
+  const tail = h.note ? `　※ ${h.note}` : '';
+  if (h.action === 'merge') return `　持股表 ${where}「${h.name}」累加為 ${fmtQty(h.qty)} 股、均價 ${h.avg}${tail}`;
+  if (h.action === 'reduce') return `　持股表 ${where}「${h.name}」剩 ${fmtQty(h.qty)} 股、均價 ${h.avg}${tail}`;
+  if (h.action === 'new') return `　持股表在 Sample（第 ${h.sampleRow} 列）下面新增第 ${h.row} 列「${h.name}」${fmtQty(h.qty)} 股、均價 ${h.avg}，請在 Excel 裡搬到該去的區塊${tail}`;
+  if (h.action === 'close') return `　持股表「${h.name}」已出清：第 ${h.row} 列清空、內容留底在第 ${h.copiedTo} 列（Sample 下面），空列請在 Excel 裡自己刪${tail}`;
+  return '';
+}
+
+function fmtQty(n) {
+  return Number.isFinite(n) ? n.toLocaleString('en-US') : String(n);
+}
+
 function renderPendingXlsxTx() {
   const btn = document.getElementById('retryXlsxTx');
   if (!btn) return;
@@ -4863,7 +4885,9 @@ async function syncTxToXlsx(acc, entry) {
   const data = await postTxToXlsx(payload);
   if (data && data.ok) {
     setXlsxTxStatus(`已寫進 ${data.sheet} 的 ${data.cell}`
-      + (data.comment ? `，註解加上「${data.comment}」` : '（註解沒寫成功）'));
+      + (data.comment ? `，註解加上「${data.comment}」` : '（註解沒寫成功）')
+      + holdingNote(data.holding),
+      !!data.holding && (!data.holding.ok || !!data.holding.note));
     return;
   }
   state.pendingXlsxTx = [...(state.pendingXlsxTx || []), payload];
@@ -4880,10 +4904,14 @@ async function flushPendingXlsxTx() {
   if (btn) btn.disabled = true;
   setXlsxTxStatus(`補寫 ${queue.length} 筆到 Excel 中…`);
   const left = [];
-  let done = 0, lastError = '';
+  let done = 0, lastError = '', holdingIssues = 0;
   for (let i = 0; i < queue.length; i++) {
     const data = await postTxToXlsx(queue[i]);
-    if (data && data.ok) { done++; continue; }
+    if (data && data.ok) {
+      done++;
+      if (data.holding && !data.holding.ok) holdingIssues++;
+      continue;
+    }
     lastError = (data && data.error) || '未知錯誤';
     // 第一筆失敗通常是 Excel 還開著，後面必然也失敗，不必每筆都再開一次
     // 活頁簿（一次要好幾秒）。剩下的原封不動留在佇列裡。
@@ -4894,9 +4922,12 @@ async function flushPendingXlsxTx() {
   await savePendingXlsxTx();
   renderPendingXlsxTx();
   if (btn) btn.disabled = false;
-  setXlsxTxStatus(left.length === 0
+  // 持股表沒同步不算「沒寫成功」——金額已經進 D／E 欄，重寫會變兩筆。
+  const holdingTail = holdingIssues ? `　其中 ${holdingIssues} 筆的持股表沒同步，要自己在 Excel 補。` : '';
+  setXlsxTxStatus((left.length === 0
     ? `已補寫 ${done} 筆到 Excel。`
-    : `補寫了 ${done} 筆，還有 ${left.length} 筆沒寫成功：${lastError}`, left.length > 0);
+    : `補寫了 ${done} 筆，還有 ${left.length} 筆沒寫成功：${lastError}`) + holdingTail,
+    left.length > 0 || holdingIssues > 0);
 }
 
 /* ---------------- add entry form ---------------- */

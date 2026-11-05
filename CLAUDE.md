@@ -125,6 +125,14 @@ When adding/removing holdings, update `ETF_CODES` / `STOCK_CODE_MAP` in `fetch_c
 
 這條路徑不碰 B2：E2（可用現金）是 `=$B$2+J47`、J47 是 `=E47-D47`，所以寫進 D／E 之後 Excel 的可用現金自己會動；`importTxByDate()`（「匯入」鈕）只改瀏覽器裡的帳戶餘額、不寫 xlsx，兩邊不會重複計算。寫入失敗（最常見是 Excel 正開著那個檔）**不回頭刪掉已經記好的交易**，而是排進 `state.pendingXlsxTx`（storage key `pending-xlsx-tx`），04 記一筆下方出現「補寫 N 筆到 Excel」讓使用者關掉 Excel 後一次補完；補寫時第一筆失敗就停手並把剩下的原封不動留在佇列，不然每筆都要重開一次活頁簿（一次好幾秒）。刪除交易紀錄一樣不回沖 Excel，與配息、持股明細的處理一致。
 
+**同一次寫入還會維護損益表下半部的持股表**（`_sync_holding_row`）。買進：單一相符列就累加庫存數量、均價重算成 `(原成本金額＋價金)/新總股數`；沒有相符列就複製 `Sample` 範本列。賣出：扣完有剩就相減並重算 `(原成本金額−價金)/剩餘股數`，歸零就先把整列複製到 `Sample` 下面留底再清空原列。庫存數量原本是公式的（ETF 整欄 B 長得像 `=3418+140+135`）照 `_append_term_to_formula` 的風格接一個加減項，不要換成單一數字。讀舊的 B／C／D 必須走 `xlsx_cell()`（借 `read_books()` 的唯讀活頁簿對，`_open_for_write()` 已經載過所以是快取命中）——寫過的檔案公式快取是空的，直接讀 `.value` 會拿到 `None`，連續兩筆同商品的第二筆就會失敗。
+
+**絕對不要用 `insert_rows()`／`delete_rows()` 改這張分頁。** openpyxl 搬動儲存格時**不會**修正公式，而這裡滿是跨列的絕對參照（`=$F$138+$E$2+$L$136-$C$2`、`=SUM(D95:D111)+SUM(D121:D134)`），連「總績效」都直接指名 `='2026損益表'!$C$55`——插一列或刪一列會讓整本活頁簿靜默算錯且不報錯。所以新增與出清都只動 `Sample`（整張分頁最後一列）以下的空白區（`_staging_row`），那裡不在任何 `=SUM(...)` 範圍內；「整列刪除」改成 `_clear_holding_row()` 清空 A~L（成本與市值歸零，對總計的效果與刪列相同），空殼留給使用者在 Excel 裡刪。實測一筆出清只改動 17 格，其他分頁與其他列的公式分毫未動。
+
+`_holding_rows()` 要排除三種列：表頭（B 欄是**非公式**的字串，`=3418+140` 這種公式字串才是持股）、A 欄空白的小計列，以及「借券(出借)」子表（0056 同時在第 95 與第 114 列，加到出借那一列是錯的；借券區從 `借券(出借)` 標記起算到下一個 A 欄空白為止）。**同名多列時刻意不自動合併**——使用者把不同批次分開記（品安 4 列、可橙 00937B 3 列），猜錯一列就改到真實部位；買進改成在 `Sample` 下面開一列，賣出直接跳過並回報。`holding_code()` 是這裡與 `read_xlsx_prices`／`update_xlsx_prices` 共用的名稱→代號換算，額外認得「中文 代號」的寫法（新增列就是這樣填的），否則那一列永遠抓不到現價。
+
+持股表出錯**不中斷** D／E 欄那筆（已經寫好了），只在回傳的 `holding` 欄位回報，前端 `holdingNote()` 翻成一句話；這種情況也**不**排進 `pendingXlsxTx`，補寫會讓金額記成兩筆。
+
 **對照表是單向的（名稱 → 代號），顯示時要反查。** 使用者在 04 記一筆 填代號（`2330`）時，`mergeTxIntoHoldings()` 建出來的列名稱就是代號本身，而 `codeForName()` 對代號是原樣回傳，所以 `nameWithCode()` 會變成「代號＝名稱」而只顯示一串數字。`nameByCode()` 用 `STOCK_CODE_MAP` 反查補上中文（同代號多名稱時取表裡**先**出現的那個——2883 的「凱基金」在舊名「開發金」前面），`canonicalName()` 則在建列與 `confirmHoldingsForAccount()` 烘焙基準值時把名稱換成中文。ETF 本來就以代號為名、不在這張表裡，反查不到就維持原樣。反查表延後到第一次用到才建：雲端版的 `STOCK_CODE_MAP` 是登入後才注入的。
 
 `mergeTxIntoHoldings()` (04 記一筆 → 持股明細) can create a holding row for a product in neither map, so a position may now exist that the price fetch never covers. The UI says so when it happens ("取盤後收盤價時抓不到現價"), but the maps still need updating by hand before prices start flowing. Note how new rows are added: appended to `state.confirmedStocks[acc]` with **qty 0**, with the real position written to `fieldOverride`. Writing the figures straight into the baseline would make `computeLiveDelta` see a zero diff, and 總覽's 庫存市值 would silently not move.
