@@ -111,16 +111,21 @@ def _finalize_prices(prices: dict, iso: str, target_iso: str, before_close: bool
     }
 
 
+def _esb_pair() -> tuple[dict[str, float], str]:
+    """把興櫃抓取的三元組收斂成 (價格, 民國日期)，與另兩支官方每日檔同形。"""
+    prices, _src, raw_date = fc.fetch_tpex_esb()
+    return prices, raw_date
+
+
 def collect_prices() -> dict:
     """抓取收盤價並整理為網頁可直接使用的格式。
 
-    已收盤時走「即時報價優先」的快路徑：該引擎只查追蹤清單、通常一秒內
-    回應，收盤後給的就是當日收盤價。官方每日檔要收盤後約一小時才產出，
-    在那之前抓回來的是前一交易日的資料，實測光上市的全量備援檔就要 45 秒
-    （指定日期端點若再連線失敗，重試會把等待拉到數分鐘），而抓回來的內容
-    幾乎整批會被即時報價覆蓋掉，並不划算。
+    已收盤時先問即時報價引擎（只查追蹤清單、通常一秒內回應），再用官方
+    每日檔覆蓋。**官方每日檔才是收盤價的權威來源**，即時報價只負責兩件
+    事：補上官方檔還沒發布的那段空窗，以及提供前一交易日收盤價（官方
+    每日檔沒有這個欄位，今日損益算不出來）。
 
-    只有在尚未收盤、或即時報價不可用時，才走官方每日檔的完整路徑。
+    只有在尚未收盤、或即時報價不可用時，才直接走官方每日檔的完整路徑。
     """
     target, before_close = fc.target_trading_date()
     target_iso = target.strftime("%Y-%m-%d")
@@ -146,46 +151,66 @@ def collect_prices() -> dict:
             log.append(f"即時報價失敗（{type(exc).__name__}），改抓官方每日檔")
 
     if realtime:
-        # 即時報價涵蓋上市與上櫃，補不到的只剩興櫃（該引擎不提供興櫃報價，
-        # tse/otc/emg/rot 四種前綴皆實測無成交價）。因此只補這一組資料集，
-        # 跳過最慢的上市／上櫃官方全量檔。
-        esb: dict[str, float] = {}
-        esb_date = ""
-        try:
-            esb, _esb_src, esb_date = fc.fetch_tpex_esb()
-            log.append(f"興櫃資料集：{len(esb)} 檔" if esb else "興櫃：所有候選端點皆無回應")
-        except Exception as exc:  # noqa: BLE001
-            log.append(f"興櫃抓取失敗（{type(exc).__name__}）")
+        # 即時報價給的是「最後一筆連續撮合成交價」，不是收盤價——13:25~13:30
+        # 的收盤集合競價不會進到這個引擎。14:00 盤後定價交易一開盤，z 欄更會
+        # 整批變成 "-"，整份清單就只剩 trade.z，而 trade 停在收盤前的最後一筆。
+        # 實測 2026-11-06 14:17：台積電 trade.z 是 13:19:35 的 2140，官方收盤價
+        # 2135；58 檔上市持股有 46 檔與官方收盤價不符（最大 0.94%）。
+        # 所以官方每日檔只要已更新到目標日，就一律蓋掉即時報價，不是只補缺漏。
+        # 三支官方檔實測各 0.1／0.6／1.1 秒，為了正確的收盤價值得。
+        prices = dict(realtime)
+        official: set[str] = set()
 
-        prices = {**esb, **realtime}  # 同一代號以即時報價為準
-        if esb and fc.roc_to_iso(esb_date) != target_iso:
-            log.append(f"⚠ 興櫃資料為 {fc.roc_to_iso(esb_date)} 收盤價，尚未更新至 {target_iso}")
+        def overlay(label: str, fetched: dict[str, float], raw_date: str) -> bool:
+            """官方檔已更新到目標日就覆蓋，回傳是否真的覆蓋了。"""
+            hit = [c for c in tracked if c in fetched]
+            iso = fc.roc_to_iso(raw_date) if raw_date else ""
+            if not hit:
+                log.append(f"{label}：查無追蹤清單中的商品")
+                return False
+            if iso != target_iso:
+                log.append(f"⚠ {label}為 {iso or '不明日期'}，尚未更新至 {target_iso}")
+                return False
+            fixed = sum(1 for c in hit if c in prices and abs(prices[c] - fetched[c]) > 1e-9)
+            for c in hit:
+                prices[c] = fetched[c]
+                official.add(c)
+            log.append(f"{label}：{len(hit)} 檔 {target_iso} 收盤價"
+                       + (f"，修正即時報價 {fixed} 檔" if fixed else ""))
+            return True
 
-        # 即時報價對「當日無成交」的商品回 "-"，這類冷門 ETF 會整檔漏掉，
-        # 但官方每日檔仍有收盤價（實測 00944 官方檔 20.63、即時報價無成交）。
-        # 分兩層補齊，兩層都只在真的有缺漏時才做，不影響正常情況的速度：
-        #   1. 上市每日檔只要 0.6 秒，便宜，優先用它補。
-        #   2. 上櫃每日檔要 25 秒、而且常常還沒更新到當日，代價不成比例；
-        #      改用即時報價已經拿到的前一交易日收盤價頂替。當日無成交，
-        #      用昨收當現價與券商軟體一致，今日損益也會正確算成 0。
-        missing = [c for c in tracked if c not in prices]
-        if missing:
+        # 興櫃放最後：它是興櫃唯一的來源（即時報價引擎不提供興櫃報價，
+        # tse/otc/emg/rot 四種前綴皆實測無成交價），所以即使尚未更新到目標
+        # 日，也只能先用它頂替那幾檔，而不是整批丟掉。
+        for label, fetcher in (("上市官方每日檔", lambda: fc.fetch_twse_dated(target)),
+                               ("上櫃官方每日檔", fc.fetch_tpex),
+                               ("興櫃官方資料集", _esb_pair)):
             try:
-                twse, twse_raw = fc.fetch_twse_dated(target)
-                if twse and fc.roc_to_iso(twse_raw) == target_iso:
-                    hit = [c for c in missing if c in twse]
-                    for c in hit:
-                        prices[c] = twse[c]
-                    if hit:
-                        log.append(f"{len(hit)} 檔當日無成交，已改由官方每日檔取得")
+                fetched, raw_date = fetcher()
             except Exception as exc:  # noqa: BLE001
-                log.append(f"官方每日檔補抓失敗（{type(exc).__name__}）")
+                log.append(f"{label}抓取失敗（{type(exc).__name__}）")
+                continue
+            if overlay(label, fetched, raw_date) or label != "興櫃官方資料集":
+                continue
+            fill = [c for c in tracked if c in fetched and c not in prices]
+            for c in fill:
+                prices[c] = fetched[c]
+            if fill:
+                log.append(f"　興櫃 {len(fill)} 檔只能暫用該日價：{'、'.join(fill)}")
 
-            fallback = [c for c in tracked if c not in prices and c in prev_closes]
-            for c in fallback:
-                prices[c] = prev_closes[c]
-            if fallback:
-                log.append(f"{len(fallback)} 檔當日無成交，以前一交易日收盤價計")
+        pending = [c for c in tracked if c in prices and c not in official]
+        if pending:
+            log.append(f"⚠ {len(pending)} 檔官方收盤價尚未發布，暫用即時報價的最後成交價："
+                       + "、".join(pending[:10]) + ("…" if len(pending) > 10 else ""))
+
+        # 即時報價對「當日無成交」的商品回 "-"，官方檔也還沒發布時就整檔
+        # 漏掉。用即時報價已經拿到的前一交易日收盤價頂替：當日無成交，用
+        # 昨收當現價與券商軟體一致，今日損益也會正確算成 0。
+        fallback = [c for c in tracked if c not in prices and c in prev_closes]
+        for c in fallback:
+            prices[c] = prev_closes[c]
+        if fallback:
+            log.append(f"{len(fallback)} 檔當日無成交，以前一交易日收盤價計")
 
         return _finalize_prices(prices, target_iso, target_iso, before_close, log, prev_closes)
 
