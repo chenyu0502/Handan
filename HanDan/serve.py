@@ -1521,6 +1521,20 @@ def _staging_row(ws, sample_row: int) -> int:
     return r
 
 
+def _writable_cell(ws, row: int, col: int):
+    """可以寫的儲存格，合併區域的非左上角格子回傳 None。
+
+    openpyxl 把合併區域裡除左上角以外的格子做成 `MergedCell`，它的 `.value`
+    是唯讀的，寫下去是 `AttributeError`。損益表的 J 欄（類別比）與 K 欄
+    （占資金）是**整個區塊合併成一格**的（`J121:J128`、`K95:K111`…），
+    清空或複製單一列時碰到就跳過——那一格屬於整個區塊，不屬於這一列。
+    """
+    from openpyxl.cell.cell import MergedCell
+
+    cell = ws.cell(row=row, column=col)
+    return None if isinstance(cell, MergedCell) else cell
+
+
 def _copy_holding_row(ws, src_row: int, dst_row: int) -> None:
     """整列複製（含格式）。公式用 openpyxl 的 Translator 平移列號，
     Sample 的 `=B141*C141` 到了 142 列才會是 `=B142*C142`；絕對參照
@@ -1530,7 +1544,9 @@ def _copy_holding_row(ws, src_row: int, dst_row: int) -> None:
 
     for c in range(1, HOLDING_LAST_COL + 1):
         src = ws.cell(row=src_row, column=c)
-        dst = ws.cell(row=dst_row, column=c)
+        dst = _writable_cell(ws, dst_row, c)
+        if dst is None:
+            continue
         value = src.value
         if isinstance(value, str) and value.startswith("="):
             try:
@@ -1551,7 +1567,9 @@ def _clear_holding_row(ws, row: int) -> None:
     對總計的影響跟刪掉一樣，空殼留在原地由使用者在 Excel 裡刪（Excel 刪列
     會自己修公式）。"""
     for c in range(1, HOLDING_LAST_COL + 1):
-        cell = ws.cell(row=row, column=c)
+        cell = _writable_cell(ws, row, c)
+        if cell is None:
+            continue
         cell.value = None
         try:
             if cell.comment is not None:
@@ -1611,14 +1629,26 @@ def _sync_holding_row(ws, ws_cached, ws_raw, name: str, side: str,
             old_cost = old_qty * old_avg  # D 多半是 `=B*C`，但 D91 是 `=8000*C91`
         return old_qty, old_avg, old_cost
 
+    def qty_avg_cells(r: int):
+        """那一列的庫存數量／平均單價格子，任一個在合併區域裡就回 None——
+        寧可整筆不動，也不要只改到一半。"""
+        q, a = _writable_cell(ws, r, HC_QTY), _writable_cell(ws, r, HC_AVG)
+        return (q, a) if q is not None and a is not None else (None, None)
+
     def new_row_from_sample() -> dict:
         dst = _staging_row(ws, sample_row)
+        name_cell, qty_cell, avg_cell = (
+            _writable_cell(ws, dst, HC_NAME), *qty_avg_cells(dst))
+        if name_cell is None or qty_cell is None:
+            return {"ok": False, "error": f"{ws.title} 第 {dst} 列（Sample 下面）在合併區域裡，沒有新增持股列"}
         _copy_holding_row(ws, sample_row, dst)
-        ws.cell(row=dst, column=HC_NAME).value = _display_name_with_code(name)
-        ws.cell(row=dst, column=HC_QTY).value = qty
-        ws.cell(row=dst, column=HC_AVG).value = round(amount / qty, 4)
+        name_cell.value = _display_name_with_code(name)
+        qty_cell.value = qty
+        avg_cell.value = round(amount / qty, 4)
         # 現價先放成交單價，損益才會從 0 起算；下次「取得盤後收盤價」會蓋掉。
-        ws.cell(row=dst, column=HC_PRICE).value = price
+        price_cell = _writable_cell(ws, dst, HC_PRICE)
+        if price_cell is not None:
+            price_cell.value = price
         return {
             "ok": True, "action": "new", "row": dst, "sheet": ws.title,
             "name": ws.cell(row=dst, column=HC_NAME).value,
@@ -1639,9 +1669,12 @@ def _sync_holding_row(ws, ws_cached, ws_raw, name: str, side: str,
         total = old_qty + qty
         if total <= 0:
             return {"ok": False, "error": f"{ws.title}!B{row} 累加後不是正數（{_fmt_num(total)}），沒有動這一列"}
+        qty_cell, avg_cell = qty_avg_cells(row)
+        if qty_cell is None:
+            return {"ok": False, "error": f"{ws.title}!B{row}／C{row} 在合併區域裡，不能寫入，沒有動這一列"}
         avg = round((old_cost + amount) / total, 4)
-        _write_holding_qty(ws.cell(row=row, column=HC_QTY), qty, total)
-        ws.cell(row=row, column=HC_AVG).value = avg
+        _write_holding_qty(qty_cell, qty, total)
+        avg_cell.value = avg
         return {"ok": True, "action": "merge", "row": row, "sheet": ws.title,
                 "name": str(ws.cell(row=row, column=HC_NAME).value).strip(),
                 "qty": total, "avg": avg}
@@ -1659,9 +1692,12 @@ def _sync_holding_row(ws, ws_cached, ws_raw, name: str, side: str,
     remain = old_qty - qty
     row_name = str(ws.cell(row=row, column=HC_NAME).value).strip()
     if remain > 0:
+        qty_cell, avg_cell = qty_avg_cells(row)
+        if qty_cell is None:
+            return {"ok": False, "error": f"{ws.title}!B{row}／C{row} 在合併區域裡，不能寫入，沒有動這一列"}
         avg = round((old_cost - amount) / remain, 4)
-        _write_holding_qty(ws.cell(row=row, column=HC_QTY), -qty, remain)
-        ws.cell(row=row, column=HC_AVG).value = avg
+        _write_holding_qty(qty_cell, -qty, remain)
+        avg_cell.value = avg
         return {"ok": True, "action": "reduce", "row": row, "sheet": ws.title,
                 "name": row_name, "qty": remain, "avg": avg}
 
@@ -1730,25 +1766,13 @@ def append_tx_to_xlsx(acc: str, date_iso: str, name: str, side: str,
     if row is None:
         return {"ok": False, "error": f"「{sheet_name}」裡找不到 {date_iso} 對應的週次（A 欄記帳日）"}
 
-    cell = ws[f"{TX_SIDE_COL[side]}{row}"]
-    formula = _append_term_to_formula(cell, amount)
-
-    comment_line = f"{name} {_fmt_num(price)}*{_fmt_num(qty)}"
-    try:
-        if cell.comment is not None and cell.comment.text:
-            cell.comment.text = cell.comment.text.rstrip("\n") + "\n" + comment_line
-        else:
-            cell.comment = Comment(comment_line, "菡萏咖啡存摺（自動）")
-    except Exception as exc:  # noqa: BLE001
-        # 註解寫不進去不該擋住金額本身，記一筆讓呼叫端顯示即可
-        print(f"[加入存摺] 寫入儲存格註解失敗（{type(exc).__name__}: {exc}）")
-        comment_line = ""
-
-    # 同一本活頁簿、同一次存檔裡順便維護下半部的持股表。讀舊的庫存數量／
-    # 平均單價要走 xlsx_cell() 的那套退路（寫入過的檔案公式快取是空的），
-    # 所以借用 read_books() 的唯讀活頁簿對——_open_for_write() 已經載過，
-    # 這裡是快取命中。持股表出錯不該擋住 D／E 欄那筆已經記好的金額，
-    # 失敗只回報，不中斷。
+    # 持股表**先**做。它要改好幾格，中途拋例外的話那本活頁簿已經被改到
+    # 一半，接著存檔就把半套結果寫進去了（實測 MergedCell 那次：留底列已
+    # 複製完成，原列只清掉 A~I）。所以失敗就整本丟掉重載，只留 D／E 欄
+    # 那一筆——那是主要目的，不該被持股表拖著一起失敗。
+    # 讀舊的庫存數量／平均單價要走 xlsx_cell() 的那套退路（寫入過的檔案
+    # 公式快取是空的），所以借用 read_books() 的唯讀活頁簿對——
+    # _open_for_write() 已經載過，這裡是快取命中。
     holding = None
     try:
         wb_cached, wb_raw, books_err = read_books()
@@ -1763,8 +1787,28 @@ def append_tx_to_xlsx(acc: str, date_iso: str, name: str, side: str,
             )
     except Exception as exc:  # noqa: BLE001
         holding = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            wb = _open_for_write(xlsx_path)
+            ws = wb[sheet_name]
+            holding["error"] += "（持股表的改動已全部丟棄）"
+        except Exception as exc2:  # noqa: BLE001
+            return {"ok": False, "error": f"持股表同步失敗後重新載入也失敗，什麼都沒寫：{type(exc2).__name__}: {exc2}"}
     if not holding.get("ok"):
         print(f"[加入存摺] 持股表沒有同步：{holding.get('error')}")
+
+    cell = ws[f"{TX_SIDE_COL[side]}{row}"]
+    formula = _append_term_to_formula(cell, amount)
+
+    comment_line = f"{name} {_fmt_num(price)}*{_fmt_num(qty)}"
+    try:
+        if cell.comment is not None and cell.comment.text:
+            cell.comment.text = cell.comment.text.rstrip("\n") + "\n" + comment_line
+        else:
+            cell.comment = Comment(comment_line, "菡萏咖啡存摺（自動）")
+    except Exception as exc:  # noqa: BLE001
+        # 註解寫不進去不該擋住金額本身，記一筆讓呼叫端顯示即可
+        print(f"[加入存摺] 寫入儲存格註解失敗（{type(exc).__name__}: {exc}）")
+        comment_line = ""
 
     try:
         wb.save(xlsx_path)
