@@ -29,6 +29,7 @@ import re
 import shutil
 import ssl
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -267,6 +268,104 @@ def fetch_tpex() -> tuple[dict[str, float], str]:
     r.raise_for_status()
     rows = r.json()
     return _parse_quotes(rows), _extract_date(rows)
+
+
+# 「單檔單月」官方日成交資訊。與每日全市場檔是同一份官方資料，但發布得早
+# 得多：實測 2026-11-06 15:18，上櫃的全市場 OpenAPI 還停在 11-05，這兩支端點
+# 已經給得出 11-06 的官方收盤價。每次回應兩三 KB、0.03~0.15 秒。
+_MONTH_SPEC = {
+    "TSE": ("https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY", "日期", "收盤價"),
+    "OTC": ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock", "日 期", "收盤"),
+}
+# 這兩支端點都只是查一檔的月報表，上游負擔小，但**證交所那一側會擋**：
+# 連續快速查詢同一個 IP 會收到 HTTP 307 導到一頁「因為安全性考量，您所執行
+# 的頁面無法呈現」（實測一次送 68 檔，有 16 檔被擋）。被擋的那幾檔只是補不到
+# 而已（會留在 log 的「⚠ 官方收盤價尚未發布」裡），但沒必要去踩，所以證交所
+# 那邊併發壓到 2，櫃買維持 6（實測 10 檔 0.12 秒，沒有被擋過）。
+MONTH_WORKERS = {"TSE": 2, "OTC": 6}
+
+
+def _month_tables(payload) -> list[dict]:
+    """統一兩個來源的外層結構：證交所把 fields/data 放在頂層，櫃買放在 tables 陣列裡。"""
+    if not isinstance(payload, dict):
+        return []
+    if isinstance(payload.get("tables"), list):
+        return payload["tables"]
+    if payload.get("fields"):
+        return [{"fields": payload["fields"], "data": payload.get("data")}]
+    return []
+
+
+def fetch_stock_month(code: str, market: str, d: datetime) -> dict[str, float]:
+    """抓單一代號、單一月份的官方日收盤價，回傳 {ISO 日期: 收盤價}。
+
+    market 只接受 "TSE"（上市）或 "OTC"（上櫃）。興櫃不適用這組端點。
+    """
+    url_base, date_key, close_key = _MONTH_SPEC[market]
+    if market == "OTC":
+        url = f"{url_base}?code={code}&date={d:%Y/%m}/01&id=&response=json"
+        sess = _tpex_session
+    else:
+        url = f"{url_base}?stockNo={code}&date={d:%Y%m}01&response=json"
+        sess = _session
+
+    r = sess.get(url, headers=HEADERS, timeout=TIMEOUT)
+    r.raise_for_status()
+    out: dict[str, float] = {}
+    for table in _month_tables(r.json()):
+        fields = [str(f).strip() for f in (table.get("fields") or [])]
+        if close_key not in fields or date_key not in fields:
+            continue
+        di, ci = fields.index(date_key), fields.index(close_key)
+        for row in (table.get("data") or []):
+            if not isinstance(row, list) or len(row) <= max(di, ci):
+                continue
+            # 日期是「115/11/06」這種帶斜線的民國格式，roc_to_iso 只吃純數字。
+            iso = roc_to_iso("".join(ch for ch in str(row[di]) if ch.isdigit()))
+            # 無成交的日子開高低收是「--」，_to_price 解析後為 None，整列跳過。
+            close = _to_price(str(row[ci]).replace(",", ""))
+            if close is not None and iso:
+                out[iso] = close
+        break
+    return out
+
+
+def fetch_official_closes(markets: dict[str, str | None], d: datetime) -> dict[str, float]:
+    """用「單檔單月」端點取得指定日的官方收盤價。
+
+    markets 是 {代號: "TSE"|"OTC"|None}；None 代表不確定屬哪個市場，會先試
+    上市再試上櫃（兩支端點對不存在的代號都只是回空表，不會報錯）。
+    回傳只含真的查到那一天的代號，查不到的不放進結果，由呼叫端決定怎麼辦。
+
+    依市場分組送出，兩組的併發上限不同（見 MONTH_WORKERS）。
+    """
+    if not markets:
+        return {}
+    iso = d.strftime("%Y-%m-%d")
+
+    def one(code: str) -> float | None:
+        wanted = markets.get(code)
+        for market in (("TSE", "OTC") if wanted is None else (wanted,)):
+            try:
+                price = fetch_stock_month(code, market, d).get(iso)
+            except Exception:  # noqa: BLE001, S112
+                continue
+            if price is not None:
+                return price
+        return None
+
+    # 市場別不明的歸到較保守的那一組，因為它第一個會去試證交所。
+    groups: dict[str, list[str]] = {}
+    for code, market in markets.items():
+        groups.setdefault(market if market in MONTH_WORKERS else "TSE", []).append(code)
+
+    out: dict[str, float] = {}
+    for market, codes in groups.items():
+        with ThreadPoolExecutor(max_workers=MONTH_WORKERS[market]) as pool:
+            for code, price in zip(codes, pool.map(one, codes)):
+                if price is not None:
+                    out[code] = price
+    return out
 
 
 def _to_price(v) -> float | None:

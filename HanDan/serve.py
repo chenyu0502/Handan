@@ -160,6 +160,10 @@ def collect_prices() -> dict:
         # 三支官方檔實測各 0.1／0.6／1.1 秒，為了正確的收盤價值得。
         prices = dict(realtime)
         official: set[str] = set()
+        # 代號屬上市還是上櫃，用全市場檔的「成員資格」判斷——那份檔案即使
+        # 日期還是前一交易日，涵蓋哪些代號仍然是對的，正好拿來決定補抓時
+        # 該打哪一支單檔端點，不必額外查一次市場別。
+        market_of: dict[str, str] = {}
 
         def overlay(label: str, fetched: dict[str, float], raw_date: str) -> bool:
             """官方檔已更新到目標日就覆蓋，回傳是否真的覆蓋了。"""
@@ -182,14 +186,17 @@ def collect_prices() -> dict:
         # 興櫃放最後：它是興櫃唯一的來源（即時報價引擎不提供興櫃報價，
         # tse/otc/emg/rot 四種前綴皆實測無成交價），所以即使尚未更新到目標
         # 日，也只能先用它頂替那幾檔，而不是整批丟掉。
-        for label, fetcher in (("上市官方每日檔", lambda: fc.fetch_twse_dated(target)),
-                               ("上櫃官方每日檔", fc.fetch_tpex),
-                               ("興櫃官方資料集", _esb_pair)):
+        for label, kind, fetcher in (("上市官方每日檔", "TSE", lambda: fc.fetch_twse_dated(target)),
+                                     ("上櫃官方每日檔", "OTC", fc.fetch_tpex),
+                                     ("興櫃官方資料集", "ESB", _esb_pair)):
             try:
                 fetched, raw_date = fetcher()
             except Exception as exc:  # noqa: BLE001
                 log.append(f"{label}抓取失敗（{type(exc).__name__}）")
                 continue
+            for c in tracked:
+                if c in fetched:
+                    market_of.setdefault(c, kind)
             if overlay(label, fetched, raw_date) or label != "興櫃官方資料集":
                 continue
             fill = [c for c in tracked if c in fetched and c not in prices]
@@ -197,6 +204,25 @@ def collect_prices() -> dict:
                 prices[c] = fetched[c]
             if fill:
                 log.append(f"　興櫃 {len(fill)} 檔只能暫用該日價：{'、'.join(fill)}")
+
+        # 全市場檔還沒更新到目標日的那些代號，改用「單檔單月」端點補——同
+        # 一份官方資料，但發布得早得多（實測 2026-11-06 15:18 上櫃全市場檔
+        # 還是 11-05，單檔端點已經有 11-06）。興櫃沒有這組端點，跳過。
+        catch_up = {c: market_of.get(c) for c in tracked
+                    if c in prices and c not in official and market_of.get(c) != "ESB"}
+        if catch_up:
+            try:
+                fixed_up = fc.fetch_official_closes(catch_up, target)
+            except Exception as exc:  # noqa: BLE001
+                fixed_up = {}
+                log.append(f"單檔月報表補抓失敗（{type(exc).__name__}）")
+            changed = sum(1 for c, p in fixed_up.items() if abs(prices[c] - p) > 1e-9)
+            for c, p in fixed_up.items():
+                prices[c] = p
+                official.add(c)
+            if fixed_up:
+                log.append(f"官方單檔月報表：補上 {len(fixed_up)} 檔 {target_iso} 收盤價"
+                           + (f"，修正即時報價 {changed} 檔" if changed else ""))
 
         pending = [c for c in tracked if c in prices and c not in official]
         if pending:
