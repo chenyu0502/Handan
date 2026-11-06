@@ -92,9 +92,14 @@ def _finalize_prices(prices: dict, iso: str, target_iso: str, before_close: bool
 
     # 中間那幾行「某來源缺幾檔、由另一個來源補上」講的是過程，很容易被讀成
     # 「現在還缺著」。最後明講最終結果，才不會讓人以為抓價沒抓完。
-    log.append(f"持股 {len(wanted)} 檔全數取得"
+    #
+    # 這裡的檔數是「追蹤清單」（ETF_CODES ＋ STOCK_CODE_MAP 的代號，目前 68）
+    # 而不是持股筆數：它是兩個帳戶的聯集、含借券(出借)子表、同商品多批次只算
+    # 一個代號。原本寫成「持股 68 檔」會讓人以為持股變多了（使用者 2026-11-06
+    # 就這樣問），所以明寫成追蹤清單。
+    log.append(f"追蹤清單 {len(wanted)} 檔全數取得"
                if not missing else
-               f"⚠ 持股 {len(wanted)} 檔僅取得 {len(wanted) - len(missing)} 檔，"
+               f"⚠ 追蹤清單 {len(wanted)} 檔僅取得 {len(wanted) - len(missing)} 檔，"
                f"未取得：{'、'.join(missing)}")
 
     return {
@@ -142,7 +147,8 @@ def collect_prices() -> dict:
             if rt_prices and rt_iso == target_iso:
                 realtime = rt_prices
                 prev_closes = rt_prev
-                log.append(f"即時報價：{len(realtime)} 檔 {target_iso} 收盤價")
+                log.append(f"即時報價：{len(realtime)} 檔 {target_iso} 最後成交價"
+                           "（待官方收盤價覆蓋）")
             elif rt_prices:
                 log.append(f"即時報價回傳 {rt_iso}，非目標日，改抓官方每日檔")
             else:
