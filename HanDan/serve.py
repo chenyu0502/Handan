@@ -1088,12 +1088,14 @@ def read_xlsx_balance() -> dict:
     balance: dict[str, float | None] = {}
     cash: dict[str, float | None] = {}
     pending_dividend: dict[str, float | None] = {}
+    fund: dict[str, dict | None] = {}
     today_iso = datetime.now().strftime("%Y-%m-%d")
     for acc, sheet_name in sheet_map.items():
         if sheet_name not in wb.sheetnames:
             balance[acc] = None
             cash[acc] = None
             pending_dividend[acc] = None
+            fund[acc] = None
             continue
         ws = wb[sheet_name]
         ws_raw = wb_raw[sheet_name] if sheet_name in wb_raw.sheetnames else None
@@ -1106,10 +1108,193 @@ def read_xlsx_balance() -> dict:
         week_net = xlsx_cell(ws, ws_raw, f"J{week_row}") if week_row else None
         cash[acc] = None if e2 is None else e2 - (week_net or 0)
         pending_dividend[acc] = _find_pending_dividend(ws, ws_raw)
+        # 基金存款／基金扣款：只有可橙有這兩欄，我的戶頭回 None（見 _fund_cells）
+        fund[acc] = _read_fund(ws, ws_raw)
 
     memo_flush()
     return {"ok": True, "balance": balance, "cash": cash,
-            "pendingDividend": pending_dividend}
+            "pendingDividend": pending_dividend, "fund": fund}
+
+
+FUND_DEPOSIT_LABEL = "基金存款"
+FUND_DEDUCT_LABEL = "基金扣款"
+# 扣款註解的記法沿用使用者原本的：一個月一行、同月的日期用「、」接在後面
+# （`10/3、10/13、10/27`）。2026 的 M2 有 31 個 `+5000`，正好等於註解裡
+# 10 個整月 ×3 ＋ 11/3 那一筆，兩邊是對得上的，所以新增時兩邊都要接。
+FUND_NOTE_SEP = "、"
+_FUND_MONTH_RE = re.compile(r"^\s*(\d{1,2})/\d{1,2}")
+
+
+def _fund_cells(ws_raw) -> tuple[str, str] | None:
+    """「基金存款」與「基金扣款」兩欄第 2 列的座標；沒有這兩欄就回 None。
+
+    用第 1 列的標籤找，**不寫死 J／M**：同一個欄位在兩個帳戶的意思不一樣
+    ——可橙的 M1 是「基金扣款」，我的戶頭的 M1 是「出借收入」。寫錯欄會把
+    出借收入整格污染掉，所以標籤對不上就一格都不碰。
+    """
+    deposit = deduct = None
+    for cell in ws_raw[1]:
+        label = cell.value.strip() if isinstance(cell.value, str) else ""
+        if label == FUND_DEPOSIT_LABEL:
+            deposit = f"{cell.column_letter}2"
+        elif label == FUND_DEDUCT_LABEL:
+            deduct = f"{cell.column_letter}2"
+    return (deposit, deduct) if deposit and deduct else None
+
+
+def _comment_body(cell) -> str:
+    """儲存格註解的內容，去掉 openpyxl 讀回來時擺在最前面的「作者:」那一行。
+
+    寫入時那一行要原樣留著（不然 Excel 裡的註解會少掉作者），只有要顯示給
+    使用者看的時候才拿掉。
+    """
+    comment = getattr(cell, "comment", None)
+    text = comment.text if comment is not None and comment.text else ""
+    lines = text.split("\n")
+    if lines and lines[0].rstrip().endswith(":"):
+        lines = lines[1:]
+    return "\n".join(lines).strip("\n")
+
+
+def _read_fund(ws, ws_raw) -> dict | None:
+    """基金存款餘額與累計扣款。沒有這兩欄的帳戶（我的戶頭）回 None。"""
+    if ws_raw is None:
+        return None
+    cells = _fund_cells(ws_raw)
+    if cells is None:
+        return None
+    deposit_co, deduct_co = cells
+    return {
+        "depositCell": deposit_co,
+        "deductCell": deduct_co,
+        "deposit": xlsx_cell(ws, ws_raw, deposit_co),
+        "deducted": xlsx_cell(ws, ws_raw, deduct_co),
+        "log": _comment_body(ws_raw[deduct_co]),
+    }
+
+
+def _append_fund_note(cell, when: datetime) -> str:
+    """把日期接進扣款註解，回傳接上去的那一段（給呼叫端回報）。
+
+    同月就接在最後一行後面（`11/3` → `11/3、11/9`），不同月才另起一行。
+    """
+    stamp = f"{when.month}/{when.day}"
+    from openpyxl.comments import Comment
+    existing = cell.comment.text if cell.comment is not None and cell.comment.text else ""
+    lines = existing.split("\n") if existing else []
+    while lines and not lines[-1].strip():
+        lines.pop()
+    m = _FUND_MONTH_RE.match(lines[-1]) if lines else None
+    if m and int(m.group(1)) == when.month:
+        lines[-1] = lines[-1].rstrip() + FUND_NOTE_SEP + stamp
+    else:
+        lines.append(stamp)
+    text = "\n".join(lines)
+    if cell.comment is not None:
+        cell.comment.text = text
+    else:
+        cell.comment = Comment(text, "菡萏咖啡存摺（自動）")
+    return stamp
+
+
+def append_fund_deduction(acc: str, amount: float, date_iso: str = "") -> dict:
+    """「基金扣款管理」：登記一筆定期定額扣款。
+
+    只動「基金扣款」那一格（可橙是 M2），照使用者的記法接一個 `+5000` 在原本
+    的公式後面，並在同一格的註解補上日期。
+
+    **不必也不該另外動帳戶餘額。** `J2 = 前一年度!J2 - M2 + 90000`，而 B2 的
+    公式長得像 `=(基底) + J2 + ...`，所以 M2 一加，基金存款與帳戶餘額都自己
+    跟著減，而可用現金 `E2 = $B$2 - $J$2 + J48` 維持不變——被扣走的錢本來就
+    已經圈在 J2 裡、不算可動用。實測 M2 +5,000 → J2 32,543→27,543、
+    B2 57,008→52,008、E2 24,465 不動。
+
+    金額限正數：負的修正會讓註解那行日期的意思對不上（那是一筆一個日期的
+    記法），要沖銷請直接在 Excel 改。
+    """
+    if acc not in ("main", "keqiang"):
+        return {"ok": False, "error": f"不明的帳戶：{acc!r}"}
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "金額必須是數字"}
+    if not math.isfinite(amount) or amount <= 0:
+        return {"ok": False, "error": "金額必須是大於 0 的數字"}
+
+    when = datetime.now()
+    if date_iso:
+        try:
+            when = datetime.strptime(date_iso, "%Y-%m-%d")
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"日期格式不正確：{date_iso!r}"}
+
+    xlsx_path = BASE_DIR / XLSX_NAME
+    if not xlsx_path.exists():
+        return {"ok": False, "error": f"找不到 {XLSX_NAME}"}
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError:
+        return {"ok": False, "error": "本機環境缺少 openpyxl 套件，無法寫入 xlsx"}
+
+    sheet_name = (f"{when.year}損益表" if acc == "main"
+                  else f"{when.year}損益表 (可橙)")
+
+    # 先用唯讀的那一對讀出改動前的數字（寫入會清掉整本的公式快取）
+    wb_cached, wb_raw, err = read_books()
+    if err:
+        return err
+    if sheet_name not in wb_raw.sheetnames:
+        return {"ok": False, "error": f"找不到分頁「{sheet_name}」"}
+    before = _read_fund(wb_cached[sheet_name], wb_raw[sheet_name])
+    if before is None:
+        return {"ok": False, "error":
+                f"分頁「{sheet_name}」沒有「{FUND_DEPOSIT_LABEL}」與"
+                f"「{FUND_DEDUCT_LABEL}」這兩欄，不處理"}
+
+    try:
+        wb = _open_for_write(xlsx_path)
+    except PermissionError:
+        return {"ok": False, "error":
+                f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，"
+                "無法寫入，請先關閉後再試一次"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
+
+    ws = wb[sheet_name]
+    cells = _fund_cells(ws)   # 寫入用的活頁簿要自己再找一次
+    if cells is None:
+        return {"ok": False, "error": f"分頁「{sheet_name}」找不到基金欄位"}
+    _, deduct_co = cells
+    cell = ws[deduct_co]
+    _append_delta_to_cell(cell, amount)
+    try:
+        stamp = _append_fund_note(cell, when)
+    except Exception as exc:  # noqa: BLE001
+        # 註解寫不進去不該擋住金額本身，跟 adjust_balance 一致
+        print(f"[基金扣款] 寫入儲存格註解失敗（{type(exc).__name__}: {exc}）")
+        stamp = ""
+
+    try:
+        wb.save(xlsx_path)
+    except PermissionError:
+        return {"ok": False, "error":
+                f"{XLSX_NAME} 目前在其他程式（可能是 Excel）中開啟，"
+                "無法寫入，請先關閉後再試一次"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"儲存失敗：{type(exc).__name__}: {exc}"}
+
+    deducted = (before.get("deducted") or 0) + amount
+    deposit = before.get("deposit")
+    return {
+        "ok": True,
+        "sheet": sheet_name,
+        "cell": deduct_co,
+        "amount": amount,
+        "date": when.strftime("%Y-%m-%d"),
+        "stamp": stamp,
+        "deducted": deducted,
+        "deposit": None if deposit is None else deposit - amount,
+    }
 
 
 def _find_pending_dividend_cell(ws):
@@ -1155,8 +1340,11 @@ def _append_delta_to_cell(cell, delta: float, cancel_last: bool = False) -> None
                 if last_value is not None and abs(last_value + delta) < 1e-9:
                     cell.value = current[: m.start()]
                     return
-        suffix = f"+{delta}" if delta >= 0 else str(delta)
-        cell.value = current + suffix
+        # 用 _fmt_num 而不是 str()：delta 一路都是 float，直接內插會寫成
+        # `+5000.0`，和使用者自己手寫的 `+5000` 不一致（Excel 開過存檔後才會
+        # 被正規化掉，在那之前公式看起來就是突兀的）。
+        num = _fmt_num(abs(delta))
+        cell.value = current + (f"+{num}" if delta >= 0 else f"-{num}")
     elif isinstance(current, (int, float)):
         cell.value = current + delta
     else:
@@ -2580,6 +2768,24 @@ class Handler(BaseHTTPRequestHandler):
                     acc=body.get("acc"),
                     delta=float(body.get("delta")),
                     note=body.get("note") or "",
+                )
+                self._send_json(200, result)
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                self._send_json(500, {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            return
+
+        if path == "/api/fund-deduction":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                result = append_fund_deduction(
+                    acc=body.get("acc"),
+                    amount=body.get("amount"),
+                    date_iso=body.get("date") or "",
                 )
                 self._send_json(200, result)
             except Exception as exc:  # noqa: BLE001
