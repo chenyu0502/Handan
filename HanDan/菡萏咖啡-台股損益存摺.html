@@ -2262,7 +2262,10 @@ function renderAccountFinance(containerId, acc) {
   const bal = effectiveBalance(acc);
   const cash = effectiveCash(acc);
   const pendingDiv = effectivePendingDividend(acc);
-  const preview = bal != null ? bal + (pendingDiv || 0) : null;
+  // 對應 Excel 的「帳戶預覽」D2 = =$E$2+$L$78，也就是**可用現金**＋未入帳配息，
+  // 不是帳戶餘額。可橙的 B2 含基金存款（見 effectiveCash），用 bal 會多算
+  // 32,543；我的戶頭 B2 = E2，兩種寫法同值，所以以前看不出來。
+  const preview = cash != null ? cash + (pendingDiv || 0) : null;
   const box = (label, kind, value) => `
     <div class="metric-card">
       <div class="m-label">${label}<\/div>
@@ -2275,7 +2278,7 @@ function renderAccountFinance(containerId, acc) {
     <div class="metric-card">
       <div class="m-label">${label}<\/div>
       <div class="m-value">${value != null ? fmtMoney(value) : '—'}<\/div>
-      <div class="m-sub">帳戶餘額＋未入帳配息<\/div>
+      <div class="m-sub">可用現金＋未入帳配息<\/div>
     <\/div>`;
   el.innerHTML = box('帳戶餘額', 'balance', bal) + previewBox('帳戶預覽', preview) + box('可用現金', 'cash', cash) + box('未入帳配息', 'pendingDividend', pendingDiv);
   el.querySelectorAll('.editable-cell').forEach(span => {
