@@ -612,11 +612,12 @@ select.row-action.is-excluded{color:var(--gain);border-color:var(--gain);}
           <!-- margin-left:auto 推到最右邊，桌面版剛好落在「未入帳配息」卡片正上方。
                匯入結果不另外顯示訊息：訊息一長就把這顆按鈕擠到下一行，而帳戶餘額
                卡片本來就會即時更新，已經看得到結果。 -->
-          <!-- 兩顆按鈕包在一起，margin-left:auto 放在容器上：基金那顆只有
-               在該帳戶有「基金存款／基金扣款」兩欄時才顯示（目前是可橙，見
-               renderFundBtn），掛在按鈕自己身上的話一隱藏就推不動另一顆了。 -->
+          <!-- 按鈕包在一起，margin-left:auto 放在容器上：前兩顆各自只在該帳戶
+               有對應欄位時才顯示（可橙有「基金扣款」、我的戶頭有「出借收入」，
+               見 renderLedgerBtns），掛在按鈕自己身上的話一隱藏就推不動其他顆。 -->
           <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;">
-            <button class="btn ghost" id="fundBtn" style="display:none;">基金扣款管理</button>
+            <button class="btn ghost ledger-btn" id="fundBtn" data-kind="fund" style="display:none;">基金扣款管理</button>
+            <button class="btn ghost ledger-btn" id="lendingBtn" data-kind="lending" style="display:none;">出借收入管理</button>
             <button class="btn ghost" id="cashAdjustBtn">存簿資金輸入</button>
           </div>
         </div>
@@ -905,7 +906,7 @@ const state = {
   yearCostBase: { main: {}, keqiang: {} }, // {account: {year: number}} — 使用者自填的「當年成本（年初庫存）」，當年績效的分母，見 yearCostBaseOf
   accountBalanceBaseline: { main: null, keqiang: null }, // 從 菡萏咖啡.xlsx 對應年度分頁 B2 讀到的基準值，每次連線 serve.py 才會有
   accountCashBaseline: { main: null, keqiang: null }, // 同一張分頁 E2（可用現金）的基準值，已扣掉本週買賣。B2 ≠ E2，見 effectiveCash
-  fundInfo: { main: null, keqiang: null }, // 基金存款（J2）／累計基金扣款（M2）與扣款日期註解；沒有這兩欄的帳戶為 null，見 openFundModal
+  ledger: { main: {}, keqiang: {} }, // {account: {kind: {label, cell, value, log, companion…}}} — 損益表第 2 列的累加欄位（可橙「基金扣款」、我的戶頭「出借收入」），見 openLedgerModal
   pendingDividendBaseline: { main: null, keqiang: null }, // 從 菡萏咖啡.xlsx 標示「(未入帳)」左邊的值讀到的基準值
   xlsxWeekly: { main: [], keqiang: [] }, // 從 菡萏咖啡.xlsx 當年損益表 A4:I55 讀到的每週記帳（含週績效），每次連線 serve.py 才會有
   xlsxWeeklyYear: null, // xlsxWeekly 對應的年度
@@ -1241,7 +1242,7 @@ async function loadAccountBalanceBaseline() {
       const data = await res.json();
       if (data && data.ok && data.balance) state.accountBalanceBaseline = data.balance;
       if (data && data.ok && data.cash) state.accountCashBaseline = data.cash;
-      if (data && data.ok && data.fund) state.fundInfo = data.fund;
+      if (data && data.ok && data.ledger) state.ledger = data.ledger;
       if (data && data.ok && data.pendingDividend) state.pendingDividendBaseline = data.pendingDividend;
     }
   } catch (e) {
@@ -2297,17 +2298,18 @@ function renderAccountFinance(containerId, acc) {
 function renderAccountFinanceAll() {
   renderAccountFinance('accountFinanceHoldings', state.account);
   renderAccountFinance('accountFinanceEtf', state.account);
-  renderFundBtn();
+  renderLedgerBtns();
 }
 
-// 「基金扣款管理」只對有「基金存款／基金扣款」兩欄的帳戶有意義（目前只有可橙；
-// 我的戶頭同一欄是「出借收入」，見 serve.py 的 _fund_cells）。沒有就整顆藏起來，
-// 不要顯示一顆按下去只會說「不支援」的按鈕。手機版是唯讀的，也不顯示。
-function renderFundBtn() {
-  const btn = document.getElementById('fundBtn');
-  if (!btn) return;
-  const has = !window.__HANDAN_MOBILE__ && !!state.fundInfo[state.account];
-  btn.style.display = has ? '' : 'none';
+// 每顆累加欄位的按鈕只在該帳戶真的有那一欄時才顯示：可橙有「基金扣款」、
+// 我的戶頭有「出借收入」，而兩者剛好都在 M 欄——所以是看標籤而不是看欄名
+// （見 serve.py 的 LEDGER_KINDS）。沒有就整顆藏起來，不要顯示一顆按下去
+// 只會說「不支援」的按鈕。手機版是唯讀的，一律不顯示。
+function renderLedgerBtns() {
+  const kinds = (!window.__HANDAN_MOBILE__ && state.ledger[state.account]) || {};
+  document.querySelectorAll('.ledger-btn').forEach(btn => {
+    btn.style.display = kinds[btn.dataset.kind] ? '' : 'none';
+  });
 }
 
 function startFinanceEdit(span) {
@@ -2367,59 +2369,89 @@ function startFinanceEdit(span) {
   input.addEventListener('click', (e) => e.stopPropagation());
 }
 
-// 「基金扣款管理」：登記一筆定期定額扣款。
+// 損益表第 2 列那幾個「逐筆累加」欄位的登記視窗，兩個帳戶共用一套：
+//   fund    可橙的「基金扣款」（M2）——定期定額扣款
+//   lending 我的戶頭的「出借收入」（M2）——借券出借的收入
+// 兩者剛好都在 M 欄但意思完全不同，所以欄位是用第 1 列的標籤找的，
+// 由 serve.py 的 LEDGER_KINDS 決定（前端只負責顯示用的文案）。
 //
-// 只寫 xlsx 的「基金扣款」那一格（可橙是 M2），接一個 `+5000` 在使用者原本的
-// 公式後面，並在同一格的註解補上日期（同月接在那一行後面、不同月另起一行，
-// 沿用使用者自己的 `10/3、10/13、10/27` 記法）。
-//
-// **刻意不動帳戶餘額、也不碰網頁端的任何覆寫值。** J2（基金存款）＝前一年度
-// 結轉 − M2 + 本年存入，而 B2（帳戶餘額）的公式本身就 `+J2`，所以 M2 一加，
-// 基金存款與帳戶餘額都自己跟著減，可用現金 E2 = B2 − J2 維持不變——被扣走的
-// 錢本來就已經圈在 J2 裡、不算可動用。寫完重讀一次基準值，卡片就跟著更新。
-function openFundModal(anchorBtn) {
-  document.querySelectorAll('.fund-modal').forEach(m => m.remove());
-  const acc = state.account;
-  const info = state.fundInfo[acc];
-  if (!info) return;
+// **都只寫那一格，不動帳戶餘額、也不碰網頁端的任何覆寫值。** 兩個帳戶的 B2
+// 公式本身就引用了那一格：可橙 `B2 = …+J2+…` 而 `J2 = 去年結轉−M2+本年存入`，
+// 所以扣款一加，基金存款與帳戶餘額自己跟著減、可用現金不變；我的戶頭
+// `B2 = …+M2+…`，出借收入一加，帳戶餘額與可用現金都跟著加。自己再加一次
+// 就是重複計算。寫完重讀一次基準值，所有卡片跟著更新。
+const LEDGER_UI = {
+  fund: {
+    title: '基金扣款管理',
+    valueLabel: '累計基金扣款',
+    companionSub: '已不計入可用現金',
+    amountLabel: '本次扣款金額',
+    dateLabel: '扣款日期',
+    defaultAmount: '5000',
+    submit: '登記扣款',
+    logTitle: '扣款日期紀錄',
+    effect: '基金存款與帳戶餘額會自己跟著減，<strong>可用現金不變<\/strong>'
+          + '（那筆錢本來就不算可動用）。',
+  },
+  lending: {
+    title: '出借收入管理',
+    valueLabel: '出借收入總額',
+    companionSub: '',
+    amountLabel: '本次出借收入',
+    dateLabel: '入帳日期',
+    defaultAmount: '',
+    submit: '登記收入',
+    logTitle: '入帳紀錄',
+    effect: '<strong>帳戶餘額與可用現金會自己跟著加<\/strong>'
+          + '（B2 的公式本身就含這一格），不必再去「存簿資金輸入」記一次。',
+  },
+};
 
-  const modal = document.createElement('div');
-  modal.className = 'div-picker fund-modal';
+function openLedgerModal(kind, anchorBtn) {
+  document.querySelectorAll('.ledger-modal').forEach(m => m.remove());
+  const acc = state.account;
+  const info = (state.ledger[acc] || {})[kind];
+  const ui = LEDGER_UI[kind];
+  if (!info || !ui) return;
+
   const money = v => (v == null ? '讀不到' : fmtMoney(v));
+  const modal = document.createElement('div');
+  modal.className = 'div-picker ledger-modal';
+  const companionCard = info.companionLabel ? `
+      <div class="metric-card">
+        <div class="m-label">${info.companionLabel}餘額<\/div>
+        <div class="m-value" id="ledgerCompanion">${money(info.companion)}<\/div>
+        <div class="m-sub">${info.companionCell || ''}${ui.companionSub ? ' · ' + ui.companionSub : ''}<\/div>
+      <\/div>` : '';
   modal.innerHTML = `
-    <div class="div-picker-title">基金扣款管理（${ACC_LABEL[acc]}）<\/div>
-    <div class="grid grid-2" style="gap:8px;margin-bottom:10px;">
+    <div class="div-picker-title">${ui.title}（${ACC_LABEL[acc]}）<\/div>
+    <div class="grid ${companionCard ? 'grid-2' : ''}" style="gap:8px;margin-bottom:10px;">
+      ${companionCard}
       <div class="metric-card">
-        <div class="m-label">基金存款餘額<\/div>
-        <div class="m-value" id="fundDeposit">${money(info.deposit)}<\/div>
-        <div class="m-sub">${info.depositCell} · 已不計入可用現金<\/div>
-      <\/div>
-      <div class="metric-card">
-        <div class="m-label">累計基金扣款<\/div>
-        <div class="m-value" id="fundDeducted">${money(info.deducted)}<\/div>
-        <div class="m-sub">${info.deductCell}<\/div>
+        <div class="m-label">${ui.valueLabel}<\/div>
+        <div class="m-value" id="ledgerValue">${money(info.value)}<\/div>
+        <div class="m-sub">${info.cell}<\/div>
       <\/div>
     <\/div>
     <div class="field">
-      <label>本次扣款金額<\/label>
-      <input type="number" id="fundAmount" step="any" min="0" value="5000">
+      <label>${ui.amountLabel}<\/label>
+      <input type="number" id="ledgerAmount" step="any" min="0" value="${ui.defaultAmount}">
     <\/div>
     <div class="field" style="margin-top:10px;">
-      <label>扣款日期<\/label>
-      <input type="date" id="fundDate" value="${todayISO()}">
+      <label>${ui.dateLabel}<\/label>
+      <input type="date" id="ledgerDate" value="${todayISO()}">
     <\/div>
     <div class="hint" style="margin-top:6px;">
-      登記後會在 <code>${info.deductCell}<\/code> 的公式接上 <code>+金額<\/code>，
-      並在該格註解記下日期。基金存款與帳戶餘額會自己跟著減，
-      <strong>可用現金不變<\/strong>（那筆錢本來就不算可動用）。
+      登記後會在 <code>${info.cell}<\/code> 的公式接上 <code>+金額<\/code>，
+      並在該格註解記下日期。${ui.effect}
     <\/div>
-    <div class="hint" id="fundStatus" style="min-height:16px;margin-top:4px;"><\/div>
+    <div class="hint" id="ledgerStatus" style="min-height:16px;margin-top:4px;"><\/div>
     <div class="div-picker-btns">
-      <button class="btn" id="fundSubmit">登記扣款<\/button>
-      <button class="btn ghost" id="fundCancel">關閉<\/button>
+      <button class="btn" id="ledgerSubmit">${ui.submit}<\/button>
+      <button class="btn ghost" id="ledgerCancel">關閉<\/button>
     <\/div>
-    <div class="div-picker-title" style="margin-top:14px;margin-bottom:4px;font-size:13px;">扣款日期紀錄<\/div>
-    <div class="hint" id="fundLog" style="white-space:pre-wrap;line-height:1.7;"><\/div>`;
+    <div class="div-picker-title" style="margin-top:14px;margin-bottom:4px;font-size:13px;">${ui.logTitle}<\/div>
+    <div class="hint" id="ledgerLog" style="white-space:pre-wrap;line-height:1.7;max-height:180px;overflow:auto;"><\/div>`;
 
   const rect = anchorBtn.getBoundingClientRect();
   modal.style.cssText = `position:fixed;z-index:999;top:${rect.bottom + 6}px;`
@@ -2429,19 +2461,21 @@ function openFundModal(anchorBtn) {
   fitModalIntoViewport(modal, rect);
   makeDraggable(modal, modal.querySelector('.div-picker-title'));
 
-  const amountInput = modal.querySelector('#fundAmount');
-  const dateInput = modal.querySelector('#fundDate');
-  const status = modal.querySelector('#fundStatus');
-  const submitBtn = modal.querySelector('#fundSubmit');
-  const logEl = modal.querySelector('#fundLog');
+  const amountInput = modal.querySelector('#ledgerAmount');
+  const dateInput = modal.querySelector('#ledgerDate');
+  const status = modal.querySelector('#ledgerStatus');
+  const submitBtn = modal.querySelector('#ledgerSubmit');
+  const logEl = modal.querySelector('#ledgerLog');
+  const companionEl = modal.querySelector('#ledgerCompanion');
 
-  // 註解是多行純文字，用 textContent 寫入（白底的 white-space:pre-wrap 負責換行），
+  // 註解是多行純文字，用 textContent 寫入（white-space:pre-wrap 負責換行），
   // 不要用 innerHTML——那是 Excel 裡使用者自己打的字，不該當成 HTML 解析。
   const paint = () => {
-    const cur = state.fundInfo[acc] || info;
-    modal.querySelector('#fundDeposit').textContent = money(cur.deposit);
-    modal.querySelector('#fundDeducted').textContent = money(cur.deducted);
+    const cur = (state.ledger[acc] || {})[kind] || info;
+    modal.querySelector('#ledgerValue').textContent = money(cur.value);
+    if (companionEl) companionEl.textContent = money(cur.companion);
     logEl.textContent = cur.log || '（這一格還沒有註解）';
+    logEl.scrollTop = logEl.scrollHeight; // 最新的一筆在最下面
   };
   paint();
 
@@ -2461,20 +2495,20 @@ function openFundModal(anchorBtn) {
     status.style.color = '';
     status.textContent = '寫入中…';
     try {
-      const res = await fetch('/api/fund-deduction', {
+      const res = await fetch('/api/ledger-append', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ acc, amount, date: dateInput.value || todayISO() }),
+        body: JSON.stringify({ acc, kind, amount, date: dateInput.value || todayISO() }),
       });
       const data = await res.json();
       if (!data || !data.ok) throw new Error((data && data.error) || '寫入失敗');
-      // 重讀基準值而不是自己推算：J2／B2 都是公式，交給 Excel 的算式去算才不會
-      // 跟 xlsx 分岔（這也會一併更新可用現金與帳戶餘額卡片）。
+      // 重讀基準值而不是自己推算：J2／B2／E2 都是公式，交給 Excel 的算式去算
+      // 才不會跟 xlsx 分岔（這也會一併更新帳戶餘額與可用現金卡片）。
       await loadAccountBalanceBaseline();
       paint();
       renderAll();
       status.style.color = 'var(--gain)';
-      status.textContent = `已登記 ${data.stamp || dateInput.value} ${fmtMoney(amount)}。`;
+      status.textContent = `已登記 ${data.stamp || dateInput.value}。`;
     } catch (e) {
       status.style.color = 'var(--loss)';
       status.textContent = String(e.message || e);
@@ -2483,7 +2517,7 @@ function openFundModal(anchorBtn) {
     }
   });
 
-  modal.querySelector('#fundCancel').addEventListener('click', () => modal.remove());
+  modal.querySelector('#ledgerCancel').addEventListener('click', () => modal.remove());
   const away = (e) => {
     if (!modal.contains(e.target) && e.target !== anchorBtn) {
       modal.remove();
@@ -5523,10 +5557,11 @@ function renderAll() {
     cashAdjustBtn.addEventListener('click', () => openCashAdjustModal(cashAdjustBtn));
   }
 
-  const fundBtn = document.getElementById('fundBtn');
-  // 顯示／隱藏交給 renderFundBtn()：要等 /api/xlsx-balance 回來才知道這個帳戶
-  // 有沒有基金欄位，而且切換帳戶時也要跟著變。
-  if (fundBtn) fundBtn.addEventListener('click', () => openFundModal(fundBtn));
+  // 顯示／隱藏交給 renderLedgerBtns()：要等 /api/xlsx-balance 回來才知道這個
+  // 帳戶有哪些欄位，而且切換帳戶時也要跟著變。
+  document.querySelectorAll('.ledger-btn').forEach(btn => {
+    btn.addEventListener('click', () => openLedgerModal(btn.dataset.kind, btn));
+  });
 
   // 配息年度選單：切換後重新指向該年度的資料並重繪整個分頁。
   // 原本這裡還有一顆「清空所有 ETF 配息設定」，是用來年底重置的；配息改成

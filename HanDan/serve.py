@@ -624,6 +624,18 @@ def _unsupported(expr: str) -> bool:
     return bool(_UNSUPPORTED.search(_QUOTED_SHEET.sub("''", expr)))
 
 
+# `SUM(D58:D74)` / `SUM('2025損益表'!A1:A9)`：唯一支援的函式。只吃單一連續
+# 範圍，巢狀或多參數（`SUM(A1:A9, B1)`）不收，交給備援表。
+_SUM_CALL = re.compile(
+    r"SUM\(\s*"
+    r"(?:'(?P<quoted>[^']+)'!|(?P<plain>[0-9A-Za-z_一-鿿]+)!)?"
+    r"\$?(?P<c1>[A-Z]{1,3})\$?(?P<r1>[1-9][0-9]{0,5})\s*:\s*"
+    r"\$?(?P<c2>[A-Z]{1,3})\$?(?P<r2>[1-9][0-9]{0,5})\s*\)",
+    re.IGNORECASE,
+)
+SUM_MAX_CELLS = 2000   # 防呆：範圍大到離譜就不算，免得一條鏈拖垮開頁速度
+
+
 def _resolve_formula(ws_raw, expr: str, seen: frozenset) -> float | None:
     """把公式裡的儲存格參照換成它們的值，再當成算式算出來。
 
@@ -631,16 +643,77 @@ def _resolve_formula(ws_raw, expr: str, seen: frozenset) -> float | None:
     期末減提領）這種層層轉介的公式。寫入現價清掉快取後，這些格子全部讀成
     None，連帶讓半年份的週記帳整批消失——所以必須自己追下去。
 
-    只支援純粹的參照與加減乘除；碰到函式或範圍就放棄（回 None），交給
-    上層的備援表。seen 記著「目前這條鏈上已經在解的格子」，用來擋住互相
-    指來指去的循環參照——用它而不是遞迴層數，結果才跟「從哪裡開始追」無關，
-    上層才可以安心把結果快取起來。
+    支援純粹的參照、加減乘除，以及 `SUM(單一連續範圍)`；其餘函式一律放棄
+    （回 None），交給上層的備援表。seen 記著「目前這條鏈上已經在解的格子」，
+    用來擋住互相指來指去的循環參照——用它而不是遞迴層數，結果才跟「從哪裡
+    開始追」無關，上層才可以安心把結果快取起來。
     """
-    if ws_raw is None or _unsupported(expr):
+    if ws_raw is None:
         return None
     wb_raw = ws_raw.parent
     wb_cached = _paired_cached_wb(wb_raw)
     failed = False
+
+    def sheet_pair(name: str):
+        """參照裡的分頁名 → (公式版, 快取版)；不存在時回 (None, None)。"""
+        if not name:
+            return ws_raw, (wb_cached[ws_raw.title]
+                            if wb_cached is not None
+                            and ws_raw.title in wb_cached.sheetnames else None)
+        if name not in wb_raw.sheetnames:
+            return None, None
+        raw = wb_raw[name]
+        return raw, (wb_cached[name] if wb_cached is not None
+                     and name in wb_cached.sheetnames else None)
+
+    def one(sheet_raw, sheet_cached, ref: str) -> float | None:
+        """單一格的值；拿不到時回 None（呼叫端決定算 0 還是失敗）。"""
+        if (sheet_raw.title, ref) in seen:   # 循環參照
+            return None
+        return xlsx_cell(sheet_cached, sheet_raw, ref, seen)
+
+    def sum_sub(m: "re.Match") -> str:
+        """把 `SUM(D58:D74)` 換成算好的總和。
+
+        `B2` 這種鏈上常常掛著一格 `=SUM(...)`（我的戶頭是 `-M100`，
+        而 `M100 = =SUM(M58:M74)`），少了這一層整條鏈就斷在那裡、只能
+        退回備援表的舊值——登記出借收入之後帳戶餘額不會動，就是這樣來的。
+
+        範圍裡的空白格算 0（跟 Excel 一致）；只要有一格「有內容卻算不出來」
+        就整條放棄，不要吐一個少算幾格的總和出去。
+        """
+        nonlocal failed
+        sheet_raw, sheet_cached = sheet_pair(m.group("quoted") or m.group("plain"))
+        if sheet_raw is None:
+            failed = True
+            return "0"
+        from openpyxl.utils import column_index_from_string, get_column_letter
+        c1 = column_index_from_string(m.group("c1").upper())
+        c2 = column_index_from_string(m.group("c2").upper())
+        r1, r2 = int(m.group("r1")), int(m.group("r2"))
+        lo_c, hi_c = min(c1, c2), max(c1, c2)
+        lo_r, hi_r = min(r1, r2), max(r1, r2)
+        if (hi_c - lo_c + 1) * (hi_r - lo_r + 1) > SUM_MAX_CELLS:
+            failed = True
+            return "0"
+        total = 0.0
+        for col in range(lo_c, hi_c + 1):
+            letter = get_column_letter(col)
+            for row in range(lo_r, hi_r + 1):
+                ref = f"{letter}{row}"
+                value = one(sheet_raw, sheet_cached, ref)
+                if value is None:
+                    if sheet_raw[ref].value is None:
+                        continue      # 空白格＝0
+                    failed = True
+                    return "0"
+                total += value
+        return repr(total)
+
+    expr = _SUM_CALL.sub(sum_sub, expr)
+    # SUM 展開完才檢查：剩下的括號／冒號就是真的不支援的東西了。
+    if failed or _unsupported(expr):
+        return None
 
     def sub(m: "re.Match") -> str:
         nonlocal failed
@@ -1088,14 +1161,14 @@ def read_xlsx_balance() -> dict:
     balance: dict[str, float | None] = {}
     cash: dict[str, float | None] = {}
     pending_dividend: dict[str, float | None] = {}
-    fund: dict[str, dict | None] = {}
+    ledger: dict[str, dict] = {}
     today_iso = datetime.now().strftime("%Y-%m-%d")
     for acc, sheet_name in sheet_map.items():
         if sheet_name not in wb.sheetnames:
             balance[acc] = None
             cash[acc] = None
             pending_dividend[acc] = None
-            fund[acc] = None
+            ledger[acc] = {}
             continue
         ws = wb[sheet_name]
         ws_raw = wb_raw[sheet_name] if sheet_name in wb_raw.sheetnames else None
@@ -1108,38 +1181,45 @@ def read_xlsx_balance() -> dict:
         week_net = xlsx_cell(ws, ws_raw, f"J{week_row}") if week_row else None
         cash[acc] = None if e2 is None else e2 - (week_net or 0)
         pending_dividend[acc] = _find_pending_dividend(ws, ws_raw)
-        # 基金存款／基金扣款：只有可橙有這兩欄，我的戶頭回 None（見 _fund_cells）
-        fund[acc] = _read_fund(ws, ws_raw)
+        # 第 2 列的累加欄位：可橙有「基金扣款」、我的戶頭有「出借收入」，
+        # 各自只會出現在自己那張分頁上（見 LEDGER_KINDS）。
+        ledger[acc] = _read_ledger(ws, ws_raw)
 
     memo_flush()
     return {"ok": True, "balance": balance, "cash": cash,
-            "pendingDividend": pending_dividend, "fund": fund}
+            "pendingDividend": pending_dividend, "ledger": ledger}
 
 
-FUND_DEPOSIT_LABEL = "基金存款"
-FUND_DEDUCT_LABEL = "基金扣款"
-# 扣款註解的記法沿用使用者原本的：一個月一行、同月的日期用「、」接在後面
-# （`10/3、10/13、10/27`）。2026 的 M2 有 31 個 `+5000`，正好等於註解裡
-# 10 個整月 ×3 ＋ 11/3 那一筆，兩邊是對得上的，所以新增時兩邊都要接。
-FUND_NOTE_SEP = "、"
-_FUND_MONTH_RE = re.compile(r"^\s*(\d{1,2})/\d{1,2}")
+# 第 2 列上那幾個「逐筆累加」的欄位。兩個帳戶共用同一套寫入流程：在那一格的
+# 公式後面接一個加項，並在同一格的註解記上日期。
+#
+# **欄位位置一律用第 1 列的標籤找，不寫死欄名。** 同一個欄位在兩個帳戶的意思
+# 不一樣——可橙的 M1 是「基金扣款」，我的戶頭的 M1 是「出借收入」——寫錯欄
+# 會把另一筆資料整格污染掉。標籤對不上就一格都不碰。
+#
+# companion 是「只顯示、不寫入」的相關欄位（基金存款會隨扣款自動減少）。
+# note 決定註解怎麼接：
+#   month-dates：一個月一行、同月的日期用「、」接在後面（`10/3、10/13、10/27`），
+#                這是使用者原本在基金扣款那格的記法。2026 的 M2 有 31 個 `+5000`，
+#                正好等於註解裡 10 個整月 ×3 ＋ 11/3，兩邊必須保持對得上。
+#   line-amount：一筆一行、帶金額（`11/9 +196`），用在金額不固定的欄位——
+#                只記日期的話看不出那一行對應公式裡的哪個加項。
+LEDGER_KINDS = {
+    "fund": {"label": "基金扣款", "companion": "基金存款", "note": "month-dates"},
+    "lending": {"label": "出借收入", "companion": None, "note": "line-amount"},
+}
+LEDGER_NOTE_SEP = "、"
+_LEDGER_MONTH_RE = re.compile(r"^\s*(\d{1,2})/\d{1,2}")
 
 
-def _fund_cells(ws_raw) -> tuple[str, str] | None:
-    """「基金存款」與「基金扣款」兩欄第 2 列的座標；沒有這兩欄就回 None。
-
-    用第 1 列的標籤找，**不寫死 J／M**：同一個欄位在兩個帳戶的意思不一樣
-    ——可橙的 M1 是「基金扣款」，我的戶頭的 M1 是「出借收入」。寫錯欄會把
-    出借收入整格污染掉，所以標籤對不上就一格都不碰。
-    """
-    deposit = deduct = None
+def _label_cell(ws_raw, label: str) -> str | None:
+    """第 1 列標籤為 label 的那一欄，第 2 列的座標；找不到回 None。"""
+    if not label:
+        return None
     for cell in ws_raw[1]:
-        label = cell.value.strip() if isinstance(cell.value, str) else ""
-        if label == FUND_DEPOSIT_LABEL:
-            deposit = f"{cell.column_letter}2"
-        elif label == FUND_DEDUCT_LABEL:
-            deduct = f"{cell.column_letter}2"
-    return (deposit, deduct) if deposit and deduct else None
+        if isinstance(cell.value, str) and cell.value.strip() == label:
+            return f"{cell.column_letter}2"
+    return None
 
 
 def _comment_body(cell) -> str:
@@ -1156,39 +1236,58 @@ def _comment_body(cell) -> str:
     return "\n".join(lines).strip("\n")
 
 
-def _read_fund(ws, ws_raw) -> dict | None:
-    """基金存款餘額與累計扣款。沒有這兩欄的帳戶（我的戶頭）回 None。"""
-    if ws_raw is None:
-        return None
-    cells = _fund_cells(ws_raw)
-    if cells is None:
-        return None
-    deposit_co, deduct_co = cells
-    return {
-        "depositCell": deposit_co,
-        "deductCell": deduct_co,
-        "deposit": xlsx_cell(ws, ws_raw, deposit_co),
-        "deducted": xlsx_cell(ws, ws_raw, deduct_co),
-        "log": _comment_body(ws_raw[deduct_co]),
-    }
+def _read_ledger(ws, ws_raw) -> dict:
+    """這張分頁上有哪些 LEDGER_KINDS 欄位，各自的目前值與註解。
 
-
-def _append_fund_note(cell, when: datetime) -> str:
-    """把日期接進扣款註解，回傳接上去的那一段（給呼叫端回報）。
-
-    同月就接在最後一行後面（`11/3` → `11/3、11/9`），不同月才另起一行。
+    回傳 {kind: {...}}，只包含這張分頁真的有的；一個都沒有就回空 dict。
     """
-    stamp = f"{when.month}/{when.day}"
+    if ws_raw is None:
+        return {}
+    out = {}
+    for kind, spec in LEDGER_KINDS.items():
+        coord = _label_cell(ws_raw, spec["label"])
+        if coord is None:
+            continue
+        entry = {
+            "label": spec["label"],
+            "cell": coord,
+            "value": xlsx_cell(ws, ws_raw, coord),
+            "log": _comment_body(ws_raw[coord]),
+            "companionLabel": spec["companion"],
+            "companionCell": None,
+            "companion": None,
+        }
+        comp = _label_cell(ws_raw, spec["companion"]) if spec["companion"] else None
+        if comp:
+            entry["companionCell"] = comp
+            entry["companion"] = xlsx_cell(ws, ws_raw, comp)
+        out[kind] = entry
+    return out
+
+
+def _append_ledger_note(cell, when: datetime, amount: float, style: str) -> str:
+    """把這一筆接進該格的註解，回傳接上去的那一段（給呼叫端回報）。
+
+    month-dates：同月接在最後一行後面（`11/3` → `11/3、11/9`），跨月才換行。
+    line-amount：一筆一行，帶金額（`11/9 +196`）。
+    """
     from openpyxl.comments import Comment
+    stamp = f"{when.month}/{when.day}"
     existing = cell.comment.text if cell.comment is not None and cell.comment.text else ""
     lines = existing.split("\n") if existing else []
     while lines and not lines[-1].strip():
         lines.pop()
-    m = _FUND_MONTH_RE.match(lines[-1]) if lines else None
-    if m and int(m.group(1)) == when.month:
-        lines[-1] = lines[-1].rstrip() + FUND_NOTE_SEP + stamp
+
+    if style == "month-dates":
+        m = _LEDGER_MONTH_RE.match(lines[-1]) if lines else None
+        if m and int(m.group(1)) == when.month:
+            lines[-1] = lines[-1].rstrip() + LEDGER_NOTE_SEP + stamp
+        else:
+            lines.append(stamp)
     else:
+        stamp = f"{stamp} +{_fmt_num(amount)}"
         lines.append(stamp)
+
     text = "\n".join(lines)
     if cell.comment is not None:
         cell.comment.text = text
@@ -1197,23 +1296,33 @@ def _append_fund_note(cell, when: datetime) -> str:
     return stamp
 
 
-def append_fund_deduction(acc: str, amount: float, date_iso: str = "") -> dict:
-    """「基金扣款管理」：登記一筆定期定額扣款。
+def append_ledger_entry(acc: str, kind: str, amount: float,
+                        date_iso: str = "") -> dict:
+    """在第 2 列的某個累加欄位上登記一筆，並在同一格的註解記下日期。
 
-    只動「基金扣款」那一格（可橙是 M2），照使用者的記法接一個 `+5000` 在原本
-    的公式後面，並在同一格的註解補上日期。
+    kind 見 LEDGER_KINDS：
+      fund    「基金扣款管理」（可橙）——定期定額扣款
+      lending 「出借收入管理」（我的戶頭）——借券出借的收入
 
-    **不必也不該另外動帳戶餘額。** `J2 = 前一年度!J2 - M2 + 90000`，而 B2 的
-    公式長得像 `=(基底) + J2 + ...`，所以 M2 一加，基金存款與帳戶餘額都自己
-    跟著減，而可用現金 `E2 = $B$2 - $J$2 + J48` 維持不變——被扣走的錢本來就
-    已經圈在 J2 裡、不算可動用。實測 M2 +5,000 → J2 32,543→27,543、
-    B2 57,008→52,008、E2 24,465 不動。
+    **兩種都只動那一格，絕對不要順手再去改帳戶餘額。** 兩個帳戶的 B2 公式
+    本身就引用了那一格：
+      可橙 `B2 = ... + J2 + ...`，而 `J2 = 前一年度!J2 - M2 + 本年存入`，
+           所以 M2 一加，基金存款與帳戶餘額都自己跟著減，可用現金
+           `E2 = $B$2 - $J$2 + J48` 不動——被扣走的錢本來就圈在 J2 裡、
+           不算可動用（實測 M2 +5,000 → J2 32,543→27,543、B2 57,008→52,008、
+           E2 24,465 不變）。
+      我的 `B2 = ... + M2 + ...`，M2 一加帳戶餘額就跟著加，而 `E2 = $B$2 + J48`
+           也跟著加——出借收入是真的進帳的錢，可用現金本來就該增加。
+    自己再加一次 B2 就是重複計算。
 
-    金額限正數：負的修正會讓註解那行日期的意思對不上（那是一筆一個日期的
-    記法），要沖銷請直接在 Excel 改。
+    金額限正數：負的沖銷會讓註解對不上（month-dates 那種只記日期、看不出
+    正負），要沖銷請直接在 Excel 改那一格的公式與註解。
     """
     if acc not in ("main", "keqiang"):
         return {"ok": False, "error": f"不明的帳戶：{acc!r}"}
+    spec = LEDGER_KINDS.get(kind)
+    if spec is None:
+        return {"ok": False, "error": f"不明的項目：{kind!r}"}
     try:
         amount = float(amount)
     except (TypeError, ValueError):
@@ -1245,11 +1354,10 @@ def append_fund_deduction(acc: str, amount: float, date_iso: str = "") -> dict:
         return err
     if sheet_name not in wb_raw.sheetnames:
         return {"ok": False, "error": f"找不到分頁「{sheet_name}」"}
-    before = _read_fund(wb_cached[sheet_name], wb_raw[sheet_name])
+    before = _read_ledger(wb_cached[sheet_name], wb_raw[sheet_name]).get(kind)
     if before is None:
         return {"ok": False, "error":
-                f"分頁「{sheet_name}」沒有「{FUND_DEPOSIT_LABEL}」與"
-                f"「{FUND_DEDUCT_LABEL}」這兩欄，不處理"}
+                f"分頁「{sheet_name}」沒有「{spec['label']}」這一欄，不處理"}
 
     try:
         wb = _open_for_write(xlsx_path)
@@ -1261,17 +1369,17 @@ def append_fund_deduction(acc: str, amount: float, date_iso: str = "") -> dict:
         return {"ok": False, "error": f"讀取失敗：{type(exc).__name__}: {exc}"}
 
     ws = wb[sheet_name]
-    cells = _fund_cells(ws)   # 寫入用的活頁簿要自己再找一次
-    if cells is None:
-        return {"ok": False, "error": f"分頁「{sheet_name}」找不到基金欄位"}
-    _, deduct_co = cells
-    cell = ws[deduct_co]
+    coord = _label_cell(ws, spec["label"])   # 寫入用的活頁簿要自己再找一次
+    if coord is None:
+        return {"ok": False, "error":
+                f"分頁「{sheet_name}」找不到「{spec['label']}」這一欄"}
+    cell = ws[coord]
     _append_delta_to_cell(cell, amount)
     try:
-        stamp = _append_fund_note(cell, when)
+        stamp = _append_ledger_note(cell, when, amount, spec["note"])
     except Exception as exc:  # noqa: BLE001
         # 註解寫不進去不該擋住金額本身，跟 adjust_balance 一致
-        print(f"[基金扣款] 寫入儲存格註解失敗（{type(exc).__name__}: {exc}）")
+        print(f"[{spec['label']}] 寫入儲存格註解失敗（{type(exc).__name__}: {exc}）")
         stamp = ""
 
     try:
@@ -1283,17 +1391,15 @@ def append_fund_deduction(acc: str, amount: float, date_iso: str = "") -> dict:
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"儲存失敗：{type(exc).__name__}: {exc}"}
 
-    deducted = (before.get("deducted") or 0) + amount
-    deposit = before.get("deposit")
     return {
         "ok": True,
+        "kind": kind,
         "sheet": sheet_name,
-        "cell": deduct_co,
+        "cell": coord,
         "amount": amount,
         "date": when.strftime("%Y-%m-%d"),
         "stamp": stamp,
-        "deducted": deducted,
-        "deposit": None if deposit is None else deposit - amount,
+        "value": (before.get("value") or 0) + amount,
     }
 
 
@@ -2778,12 +2884,13 @@ class Handler(BaseHTTPRequestHandler):
                 })
             return
 
-        if path == "/api/fund-deduction":
+        if path == "/api/ledger-append":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(length) or b"{}")
-                result = append_fund_deduction(
+                result = append_ledger_entry(
                     acc=body.get("acc"),
+                    kind=body.get("kind"),
                     amount=body.get("amount"),
                     date_iso=body.get("date") or "",
                 )
