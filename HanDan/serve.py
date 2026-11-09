@@ -613,6 +613,15 @@ _CELL_REF = re.compile(
 # 有函式呼叫（SUM(...)）或範圍（G2:R2）就不解析——逐格代入的做法算不出來，
 # 硬套只會把 `SUM` 前後的參照亂代一通。
 _UNSUPPORTED = re.compile(r"[0-9A-Za-z_一-鿿]\s*\(|:")
+# 判斷「是不是函式呼叫」之前先把引號裡的分頁名抽掉。分頁名自己就帶括號
+# （「2025損益表 (可橙)」），`表 (` 會命中上面那條規則，於是**可橙每一條跨年度
+# 參照都解析不出來**：B2 只能靠備援表活著，備援表一冷掉帳戶餘額就空白。
+_QUOTED_SHEET = re.compile(r"'[^']*'")
+
+
+def _unsupported(expr: str) -> bool:
+    """公式裡有函式呼叫或範圍嗎？先剝掉引號內的分頁名再判斷。"""
+    return bool(_UNSUPPORTED.search(_QUOTED_SHEET.sub("''", expr)))
 
 
 def _resolve_formula(ws_raw, expr: str, seen: frozenset) -> float | None:
@@ -627,7 +636,7 @@ def _resolve_formula(ws_raw, expr: str, seen: frozenset) -> float | None:
     指來指去的循環參照——用它而不是遞迴層數，結果才跟「從哪裡開始追」無關，
     上層才可以安心把結果快取起來。
     """
-    if ws_raw is None or _UNSUPPORTED.search(expr):
+    if ws_raw is None or _unsupported(expr):
         return None
     wb_raw = ws_raw.parent
     wb_cached = _paired_cached_wb(wb_raw)
@@ -651,6 +660,12 @@ def _resolve_formula(ws_raw, expr: str, seen: frozenset) -> float | None:
             return "0"
         value = xlsx_cell(sheet_cached, sheet_raw, ref, seen)
         if value is None:
+            # 參照到真正空白的格子時，Excel 當它是 0（`=E48-D48` 這週還沒交易
+            # 就是 0、可橙 2025 的 `=9693-K2+J2` 裡 K2 一直空著）。只有「有公式
+            # 或有內容卻算不出來」才算失敗、交給備援表——否則一個空格就讓整條
+            # 鏈斷掉，E2 這種層層轉介的格子永遠讀不到。
+            if sheet_raw[ref].value is None:
+                return "0"
             failed = True
             return "0"
         return repr(value)
@@ -1043,7 +1058,18 @@ def _find_pending_dividend(ws, ws_raw=None) -> float | None:
 
 
 def read_xlsx_balance() -> dict:
-    """讀取「菡萏咖啡.xlsx」對應年度分頁的帳戶餘額（B2）與未入帳配息基準值。
+    """讀取「菡萏咖啡.xlsx」對應年度分頁的帳戶餘額（B2）、可用現金與未入帳配息。
+
+    **帳戶餘額（B2）不等於可用現金（E2）。** 可橙戶頭有一欄「基金存款」（J 欄，
+    J2 是累計額、M2 是累計扣款），那筆錢鎖在定期定額基金裡不能買股票，所以
+    B2 含它、E2 把它扣掉：`E2 = $B$2 - $J$2 + J48`。週記帳的「即時庫存」C 欄
+    用的是 E2（`=$F$80+$E$2+$L$78-$C$2`），所以網頁的可用現金也必須用 E2 的
+    口徑，否則「當週損益」的比較基準會固定多算一整筆基金存款（實測可橙
+    32,543，每週都在、不會自己消失）。我的戶頭沒有這一欄，E2 = B2。
+
+    回傳的 cash 是 **E2 - J{本週列}**，也就是「本週還沒發生買賣時的可用現金」：
+    E2 已經含 Excel 那側本週的買賣淨額（J48），而網頁另外用 currentWeekTxNet()
+    算同一件事，直接給 E2 會把本週交易算兩次。
 
     A2 是「帳戶餘額」這個標籤本身，B2 才是數值格；使用者目前多半還沒填，
     讀到空值就回傳 null，網頁端會顯示「尚未設定」並讓使用者直接手動輸入覆寫。
@@ -1060,19 +1086,30 @@ def read_xlsx_balance() -> dict:
     year = datetime.now().year
     sheet_map = {"main": f"{year}損益表", "keqiang": f"{year}損益表 (可橙)"}
     balance: dict[str, float | None] = {}
+    cash: dict[str, float | None] = {}
     pending_dividend: dict[str, float | None] = {}
+    today_iso = datetime.now().strftime("%Y-%m-%d")
     for acc, sheet_name in sheet_map.items():
         if sheet_name not in wb.sheetnames:
             balance[acc] = None
+            cash[acc] = None
             pending_dividend[acc] = None
             continue
         ws = wb[sheet_name]
         ws_raw = wb_raw[sheet_name] if sheet_name in wb_raw.sheetnames else None
         balance[acc] = xlsx_cell(ws, ws_raw, "B2")
+        e2 = xlsx_cell(ws, ws_raw, "E2")
+        week_row = _weekly_row_for_date(ws, today_iso)
+        # 扣掉本週列的 J 欄（Excel 那側已記的本週買賣淨額），見 docstring。
+        # 讀不到 E2 就不給 cash，讓前端自己退回 B2——寧可少給，也不要把含
+        # 基金存款的數字冒充可用現金。
+        week_net = xlsx_cell(ws, ws_raw, f"J{week_row}") if week_row else None
+        cash[acc] = None if e2 is None else e2 - (week_net or 0)
         pending_dividend[acc] = _find_pending_dividend(ws, ws_raw)
 
     memo_flush()
-    return {"ok": True, "balance": balance, "pendingDividend": pending_dividend}
+    return {"ok": True, "balance": balance, "cash": cash,
+            "pendingDividend": pending_dividend}
 
 
 def _find_pending_dividend_cell(ws):
