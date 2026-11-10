@@ -81,7 +81,8 @@ BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False
 
 def _finalize_prices(prices: dict, iso: str, target_iso: str, before_close: bool,
                      log: list[str], prev_closes: dict | None = None,
-                     pending: list[str] | None = None) -> dict:
+                     pending: list[str] | None = None,
+                     ex_rights: dict | None = None) -> dict:
     """把抓到的價格篩成追蹤清單，組成網頁需要的回傳格式。
 
     prev_closes 是前一交易日收盤價，只有即時報價引擎提供得出來，用於前端
@@ -127,6 +128,9 @@ def _finalize_prices(prices: dict, iso: str, target_iso: str, before_close: bool
         "prices": {c: prices[c] for c in wanted if c in prices},
         "prevCloses": {c: prev[c] for c in wanted if c in prev},
         "missing": missing,
+        # 當日除權息：前端拿自己的股數乘上去，提醒使用者登記那筆配息。
+        # 股數只有前端知道（有排除計算、有手動覆寫），所以這裡只給每股金額。
+        "exRights": ex_rights or {},
         "unresolved": fc.UNRESOLVED,
         "log": log,
         "fetchedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -153,6 +157,13 @@ def collect_prices() -> dict:
     target_iso = target.strftime("%Y-%m-%d")
     tracked = sorted(set(fc.ETF_CODES) | set(fc.STOCK_CODE_MAP.values()))
     log: list[str] = []
+
+    def ex_rights_today() -> dict:
+        """當日除權息，只留追蹤清單裡的。抓不到就回空的，不擋抓價本身。"""
+        try:
+            return {c: v for c, v in fc.fetch_ex_rights(target).items() if c in tracked}
+        except Exception:  # noqa: BLE001
+            return {}
 
     # --- 快路徑：已收盤時先問即時報價引擎 ---------------------------------
     realtime: dict[str, float] = {}
@@ -251,7 +262,7 @@ def collect_prices() -> dict:
             log.append(f"{len(fallback)} 檔當日無成交，以前一交易日收盤價計")
 
         return _finalize_prices(prices, target_iso, target_iso, before_close, log,
-                                prev_closes, pending)
+                                prev_closes, pending, ex_rights_today())
 
     # --- 完整路徑：尚未收盤，或即時報價不可用 -----------------------------
     # 先試指定日期，失敗則退回最新一期。
@@ -328,7 +339,8 @@ def collect_prices() -> dict:
     if esb and fc.roc_to_iso(esb_date) != iso:
         log.append(f"⚠ 興櫃資料為 {fc.roc_to_iso(esb_date)} 收盤價，尚未更新至 {iso}")
 
-    return _finalize_prices(prices, iso, target_iso, before_close, log, prev_closes)
+    return _finalize_prices(prices, iso, target_iso, before_close, log, prev_closes,
+                            None, ex_rights_today())
 
 
 def update_xlsx_prices(prices: dict) -> dict:

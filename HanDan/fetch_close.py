@@ -42,6 +42,16 @@ from urllib3.util.retry import Retry
 TWSE_CSV = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data"
 TWSE_DATED = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json&date={ymd}"
 TPEX_JSON = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+# 除權息。除權息當天的「參考價」＝前一交易日收盤價 − 權值息值，而 MIS 的 y 欄
+# 給的正是參考價——所以除息當天「今日損益」的基準會比前一日收盤低一截，那不是
+# 虧損，是配息離開了股價。查出「今天有哪幾檔除權息、每股多少」，網頁才能提醒
+# 使用者去登記那筆配息（否則當週損益會憑空少一塊，見 CLAUDE.md）。
+TWSE_EXRIGHT = ("https://www.twse.com.tw/rwd/zh/exRight/TWT49U"
+                "?startDate={ymd}&endDate={ymd}&response=json")
+# 櫃買這支是「近期除權息」的滾動清單（實測涵蓋前後約兩週），日期要自己過濾。
+# 另一支 www/zh-tw/bulletin/exDailyQ 欄位更齊，但它**忽略 date 參數**——不管
+# 傳哪一天都回同一個未來視窗，不能用來問「某一天除了什麼」。
+TPEX_EXRIGHT = "https://www.tpex.org.tw/openapi/v1/tpex_exright_prepost"
 # 上市櫃共用的即時報價引擎。tpex_mainboard_daily_close_quotes 這份官方批次檔
 # 收盤後常要等一兩小時才處理完當天資料，但這個引擎在收盤當下（最後成交時間
 # 13:30:00）就已經反映最後成交價，可以更快拿到當日收盤價，用來補上還沒更新的部分。
@@ -375,6 +385,60 @@ def _to_price(v) -> float | None:
     except (TypeError, ValueError):
         return None
     return f if f > 0 else None
+
+
+def fetch_ex_rights(d: datetime) -> dict[str, dict]:
+    """指定日除權息的商品：`{代號: {"name", "kind", "cash"}}`。
+
+    kind 是「息」或「權」；cash 是每股現金股利（上市取「權值+息值」）。
+    cash 為 None 代表官方還沒公告金額——櫃買的清單會先列出日期、金額寫
+    「尚未公告」——那時照樣要提醒，只是講不出金額。
+
+    兩支來源各自失敗都只是少一邊，不要讓它擋住抓價本身。
+    """
+    out: dict[str, dict] = {}
+
+    # 上市：可以指定日期查，欄位有「權值+息值」，最精確
+    try:
+        r = _session.get(TWSE_EXRIGHT.format(ymd=d.strftime("%Y%m%d")),
+                         headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        j = r.json()
+        fields = [str(x).strip() for x in (j.get("fields") or [])]
+        need = ("股票代號", "股票名稱", "權值+息值", "權/息")
+        if all(k in fields for k in need):
+            idx = {k: fields.index(k) for k in need}
+            for row in (j.get("data") or []):
+                code = str(row[idx["股票代號"]]).strip()
+                if code:
+                    out[code] = {
+                        "name": str(row[idx["股票名稱"]]).strip(),
+                        "kind": str(row[idx["權/息"]]).strip(),
+                        "cash": _to_price(str(row[idx["權值+息值"]]).replace(",", "")),
+                    }
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    # 上櫃：滾動清單，自己比對民國日期
+    try:
+        rows = _tpex_session.get(TPEX_EXRIGHT, headers=HEADERS, timeout=TIMEOUT).json()
+        roc = f"{d.year - 1911}{d:%m%d}"
+        for x in (rows if isinstance(rows, list) else []):
+            if str(x.get("ExRrightsExDividendDate", "")).strip() != roc:
+                continue
+            code = str(x.get("SecuritiesCompanyCode", "")).strip()
+            if not code:
+                continue
+            out.setdefault(code, {
+                "name": str(x.get("CompanyName", "")).strip(),
+                # 這邊寫「除息」「除權」，上市那邊只寫「息」「權」，統一成後者
+                "kind": str(x.get("ExRrightsExDividend", "")).strip().lstrip("除"),
+                "cash": _to_price(str(x.get("CashDividend", "")).replace(",", "")),
+            })
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    return out
 
 
 def fetch_realtime_quotes(codes: list[str]) -> tuple[dict[str, float], dict[str, float], str]:

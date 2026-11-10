@@ -2156,6 +2156,48 @@ function targetCloseDate(now = new Date()) {
   return { iso: `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`, beforeClose };
 }
 
+// 當日除權息的提醒。除權息當天的「參考價」＝前一交易日收盤 − 權值息值，而
+// 今日損益的基準（MIS 的 y 欄）用的就是參考價——所以除息造成的跌價**不會**被
+// 算成虧損，這是對的。但「當週損益」算的是即時庫存（庫存市值＋可用現金＋
+// 未入帳配息）的實際變化，除息當下那筆錢已經離開股價、還沒進未入帳配息，
+// 所以會暫時少一塊：2026-11-10 的 00940 就讓當週損益顯示 171,946 而不是兩天
+// 「今日損益」相加的 173,146，差的正是 0.06×20,000。登記配息之後就補回來。
+//
+// 伺服器只給每股金額（股數只有前端知道——有排除計算、有手動覆寫），這裡乘上
+// 各帳戶自己的股數。只持有在一個帳戶時就只列那一個。
+function exRightsNote(exRights) {
+  const entries = Object.entries(exRights || {});
+  if (!entries.length) return '';
+  const lines = [];
+  for (const [code, info] of entries) {
+    const holds = [];
+    for (const acc of ['main', 'keqiang']) {
+      let qty = 0;
+      baseStocks(acc).forEach(r => {
+        if (effectiveSold(acc, r) || effectiveCalcExcluded(acc, r)) return;
+        if (codeForName(r.name) !== code) return;
+        qty += effectiveStock(acc, r).qty || 0;
+      });
+      if (qty > 0) holds.push({ acc, qty });
+    }
+    if (!holds.length) continue;   // 追蹤清單有、但目前沒持有
+    const name = nameByCode(code) || info.name || code;
+    const kind = info.kind === '權' ? '除權' : '除息';
+    const per = info.cash != null ? `每股 ${info.cash}` : '金額尚未公告';
+    const detail = holds.map(h => {
+      const shares = `${Math.round(h.qty).toLocaleString()} 股`;
+      return info.cash != null
+        ? `${ACC_LABEL[h.acc]} ${shares}，約 ${fmtMoney(h.qty * info.cash)}`
+        : `${ACC_LABEL[h.acc]} ${shares}`;
+    }).join('、');
+    lines.push(`${kind}：${name}（${code}）${per} — ${detail}`);
+  }
+  if (!lines.length) return '';
+  return `<br><small style="color:var(--gain)">💰 今日${lines.join('；')}<\/small>`
+    + '<br><small>　到「03 存股與配息」把這筆登記起來，「當週損益」才會算進去'
+    + '（配息離開股價時並不是虧損，所以「今日損益」本來就不受影響）。<\/small>';
+}
+
 async function fetchClosePrice(statusEl, syncXlsx = false) {
   // 兩段式取價：
   //   1. 若本頁由 serve.py 提供（http://127.0.0.1:8765），呼叫本機 API。
@@ -2254,7 +2296,7 @@ async function fetchClosePrice(statusEl, syncXlsx = false) {
         : `<small>${line}<\/small>`)
       .join('<br>');
     setMsg(`✅ 即時抓取成功，已填入 ${updated} 檔（${live.fetchedAt}）`
-      + `<br>${logLines}${stale}${missMsg}${xlsxMsg}`);
+      + `<br>${logLines}${stale}${missMsg}${xlsxMsg}${exRightsNote(live.exRights)}`);
   } else {
     // 三種失敗情境的成因與處理方式都不同，訊息必須分開，否則會把使用者
     // 導向錯誤的排查方向（例如叫已經在跑 serve.py 的人再去啟動一次）。
