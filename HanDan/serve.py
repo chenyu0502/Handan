@@ -80,27 +80,44 @@ BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False
 
 
 def _finalize_prices(prices: dict, iso: str, target_iso: str, before_close: bool,
-                     log: list[str], prev_closes: dict | None = None) -> dict:
+                     log: list[str], prev_closes: dict | None = None,
+                     pending: list[str] | None = None) -> dict:
     """把抓到的價格篩成追蹤清單，組成網頁需要的回傳格式。
 
     prev_closes 是前一交易日收盤價，只有即時報價引擎提供得出來，用於前端
     計算「今日損益」。走官方每日檔的路徑時會是空的，前端該卡片顯示為無資料。
+
+    pending 是「拿到價了、但還不是官方收盤價」的代號（只有快路徑會有）。
     """
     wanted = set(fc.ETF_CODES) | set(fc.STOCK_CODE_MAP.values())
     prev = prev_closes or {}
     missing = sorted(wanted - prices.keys())
+    got = len(wanted) - len(missing)
+    waiting = pending or []
 
-    # 中間那幾行「某來源缺幾檔、由另一個來源補上」講的是過程，很容易被讀成
-    # 「現在還缺著」。最後明講最終結果，才不會讓人以為抓價沒抓完。
+    # 整趟抓價只在這裡寫結論。中間「哪一支來源拿到幾檔」是過程，寫出來又長
+    # 又容易被讀成「現在還缺著」，一律不寫；真正需要使用者做事的只有兩件：
+    # 有沒有漏抓，以及有沒有還不是官方價的。
     #
-    # 這裡的檔數是「追蹤清單」（ETF_CODES ＋ STOCK_CODE_MAP 的代號，目前 68）
-    # 而不是持股筆數：它是兩個帳戶的聯集、含借券(出借)子表、同商品多批次只算
-    # 一個代號。原本寫成「持股 68 檔」會讓人以為持股變多了（使用者 2026-11-06
-    # 就這樣問），所以明寫成追蹤清單。
-    log.append(f"追蹤清單 {len(wanted)} 檔全數取得"
-               if not missing else
-               f"⚠ 追蹤清單 {len(wanted)} 檔僅取得 {len(wanted) - len(missing)} 檔，"
-               f"未取得：{'、'.join(missing)}")
+    # 檔數是「追蹤清單」（ETF_CODES ＋ STOCK_CODE_MAP 的代號，目前 68）而不是
+    # 持股筆數：它是兩個帳戶的聯集、含借券(出借)子表、同商品多批次只算一個
+    # 代號。寫成「持股 68 檔」會讓人以為持股變多了（使用者 2026-11-06 就這樣問）。
+    if missing:
+        log.append(f"⚠ 追蹤清單 {len(wanted)} 檔只取得 {got} 檔，"
+                   f"未取得：{'、'.join(missing)}")
+    elif waiting:
+        log.append(f"{iso} 收盤價：官方 {got - len(waiting)} 檔、"
+                   f"暫用盤中最後成交價 {len(waiting)} 檔")
+    else:
+        log.append(f"{iso} 收盤價：追蹤清單 {got} 檔全數為官方公布價")
+
+    if waiting:
+        # 這幾檔的官方收盤價通常 15:30 前後才發布（上櫃的全市場檔最慢，實測
+        # 15:18 仍停在前一交易日）。不講這句的話，使用者就會像 2026-11-09 那樣
+        # 讓盤中最後成交價留一整晚——隔天 00940 的「今日損益」因此差了 1,200。
+        log.append(f"⚠ 這 {len(waiting)} 檔官方收盤價還沒發布，暫用盤中最後成交價："
+                   + "、".join(waiting[:12]) + ("…" if len(waiting) > 12 else ""))
+        log.append("　約 15:30 之後再按一次「取得盤後收盤價」，就會自動換成官方價。")
 
     return {
         "ok": True,
@@ -145,10 +162,10 @@ def collect_prices() -> dict:
             rt_prices, rt_prev, rt_date = fc.fetch_realtime_quotes(tracked)
             rt_iso = fc.roc_to_iso(rt_date)
             if rt_prices and rt_iso == target_iso:
+                # 成功是常態，不寫進 log——它只是官方檔的墊底，最後有幾檔真的
+                # 停在這個值，由 _finalize_prices 的 pending 那兩行交代。
                 realtime = rt_prices
                 prev_closes = rt_prev
-                log.append(f"即時報價：{len(realtime)} 檔 {target_iso} 最後成交價"
-                           "（待官方收盤價覆蓋）")
             elif rt_prices:
                 log.append(f"即時報價回傳 {rt_iso}，非目標日，改抓官方每日檔")
             else:
@@ -171,22 +188,18 @@ def collect_prices() -> dict:
         # 該打哪一支單檔端點，不必額外查一次市場別。
         market_of: dict[str, str] = {}
 
+        # 每一支來源抓到什麼，不再逐條寫進 log——那些都是過程，使用者要看的是
+        # 結果（哪幾檔還不是官方價）。只有「抓取失敗」這種需要處理的才留下來，
+        # 最後由 _finalize_prices 寫一行總結。
         def overlay(label: str, fetched: dict[str, float], raw_date: str) -> bool:
             """官方檔已更新到目標日就覆蓋，回傳是否真的覆蓋了。"""
             hit = [c for c in tracked if c in fetched]
             iso = fc.roc_to_iso(raw_date) if raw_date else ""
-            if not hit:
-                log.append(f"{label}：查無追蹤清單中的商品")
+            if not hit or iso != target_iso:
                 return False
-            if iso != target_iso:
-                log.append(f"⚠ {label}為 {iso or '不明日期'}，尚未更新至 {target_iso}")
-                return False
-            fixed = sum(1 for c in hit if c in prices and abs(prices[c] - fetched[c]) > 1e-9)
             for c in hit:
                 prices[c] = fetched[c]
                 official.add(c)
-            log.append(f"{label}：{len(hit)} 檔 {target_iso} 收盤價"
-                       + (f"，修正即時報價 {fixed} 檔" if fixed else ""))
             return True
 
         # 興櫃放最後：它是興櫃唯一的來源（即時報價引擎不提供興櫃報價，
@@ -222,18 +235,11 @@ def collect_prices() -> dict:
             except Exception as exc:  # noqa: BLE001
                 fixed_up = {}
                 log.append(f"單檔月報表補抓失敗（{type(exc).__name__}）")
-            changed = sum(1 for c, p in fixed_up.items() if abs(prices[c] - p) > 1e-9)
             for c, p in fixed_up.items():
                 prices[c] = p
                 official.add(c)
-            if fixed_up:
-                log.append(f"官方單檔月報表：補上 {len(fixed_up)} 檔 {target_iso} 收盤價"
-                           + (f"，修正即時報價 {changed} 檔" if changed else ""))
 
         pending = [c for c in tracked if c in prices and c not in official]
-        if pending:
-            log.append(f"⚠ {len(pending)} 檔官方收盤價尚未發布，暫用即時報價的最後成交價："
-                       + "、".join(pending[:10]) + ("…" if len(pending) > 10 else ""))
 
         # 即時報價對「當日無成交」的商品回 "-"，官方檔也還沒發布時就整檔
         # 漏掉。用即時報價已經拿到的前一交易日收盤價頂替：當日無成交，用
@@ -244,7 +250,8 @@ def collect_prices() -> dict:
         if fallback:
             log.append(f"{len(fallback)} 檔當日無成交，以前一交易日收盤價計")
 
-        return _finalize_prices(prices, target_iso, target_iso, before_close, log, prev_closes)
+        return _finalize_prices(prices, target_iso, target_iso, before_close, log,
+                                prev_closes, pending)
 
     # --- 完整路徑：尚未收盤，或即時報價不可用 -----------------------------
     # 先試指定日期，失敗則退回最新一期。

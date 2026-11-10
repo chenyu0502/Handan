@@ -2165,9 +2165,11 @@ async function fetchClosePrice(statusEl, syncXlsx = false) {
   //   2. 否則（Claude 預覽或直接開檔，未透過 serve.py）退回使用內建的收盤價快照。
   const setMsg = html => { if (statusEl) statusEl.innerHTML = html; };
   const tgt = targetCloseDate();
+  // 已收盤取當日是常態，日期也已經寫在伺服器回傳的結論那一行裡，再講一次只是
+  // 把訊息拉長；只有「還沒收盤所以抓的是前一交易日」才需要特別說明。
   const ruleNote = tgt.beforeClose
     ? `尚未收盤（13:30 前），依規則取前一交易日 <b>${tgt.iso}<\/b>`
-    : `已收盤（13:30 後），依規則取當日 <b>${tgt.iso}<\/b>`;
+    : '';
 
   let live = null;
   let liveError = null;
@@ -2243,8 +2245,16 @@ async function fetchClosePrice(statusEl, syncXlsx = false) {
         ? `<br><small>已同步寫入 <code>菡萏咖啡.xlsx<\/code> 現價欄位（${live.xlsx.updatedCount} 格）。<\/small>`
         : `<br><small style="color:var(--gain)">寫入 菡萏咖啡.xlsx 失敗：${live.xlsx.error}<\/small>`)
       : '';
-    setMsg(`✅ 即時抓取成功，已填入 ${updated} 檔，資料日期 <b>${dataDate}<\/b>（${live.fetchedAt}）`
-      + `<br><small>${ruleNote}　·　${live.log.join('　/　')}<\/small>${stale}${missMsg}${xlsxMsg}`);
+    // 每條訊息各自一行，不要用「/」串成一長條：伺服器那邊已經精簡成「結論＋
+    // 需要處理的事」，擠成一行反而讓「記得 15:30 後再按一次」那句被淹掉。
+    // 開頭的 ⚠ 是需要使用者做事的，標成警示色。
+    const logLines = [ruleNote, ...(live.log || [])].filter(Boolean)
+      .map(line => line.trim().startsWith('⚠')
+        ? `<small style="color:var(--gain)">${line}<\/small>`
+        : `<small>${line}<\/small>`)
+      .join('<br>');
+    setMsg(`✅ 即時抓取成功，已填入 ${updated} 檔（${live.fetchedAt}）`
+      + `<br>${logLines}${stale}${missMsg}${xlsxMsg}`);
   } else {
     // 三種失敗情境的成因與處理方式都不同，訊息必須分開，否則會把使用者
     // 導向錯誤的排查方向（例如叫已經在跑 serve.py 的人再去啟動一次）。
@@ -2258,7 +2268,7 @@ async function fetchClosePrice(statusEl, syncXlsx = false) {
       reason = `本機服務已啟動，但讀取「菡萏咖啡.xlsx」時發生問題：${detail}。請確認該檔案存在、且沒有開在 Excel 裡，或按「取得盤後收盤價」重新抓取。`;
     }
     setMsg(`已填入 ${updated} 檔，使用<b>內建快照<\/b> ${dataDate} 的收盤價。`
-      + `<br><small>${ruleNote}<\/small>`
+      + (ruleNote ? `<br><small>${ruleNote}<\/small>` : '')
       + `<br><small style="color:var(--gain)">${reason}<\/small>`
       + missMsg);
   }
