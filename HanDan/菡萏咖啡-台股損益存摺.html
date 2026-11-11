@@ -1280,23 +1280,30 @@ function currentWeekTxNet(acc) {
 // currentWeekTxNet）。「當週」是指今天所在的這一週。按下「匯入」後那幾筆會
 // 被標記為已匯入並從這裡排除，所以本週隨時都可以匯入，不必等整週結束。
 // 手動覆寫值可在該欄位輸入空白清除，清除後恢復為這裡的計算值。
+// 可用現金與帳戶餘額差一筆「基金存款」（可橙的 J2；我的戶頭沒這一欄，差 0）。
+// 兩個基準值都來自 xlsx 的同一瞬間，相減剛好就是那筆：
+//   帳戶餘額基準 = B2
+//   可用現金基準 = E2 − J{本週列}，而 E2 = B2 − J2 + J{本週列}
+//   → 相減 = J2
+// 用「差額」而不是直接拿可用現金基準當答案，是因為那個基準**開頁後就不會再更新**：
+// 配息匯入、刪除配息、04 記一筆的匯入都只改瀏覽器裡的帳戶餘額（前兩者也會寫
+// xlsx，但網頁這邊不會重讀），直接用基準的話可用現金整個 session 都不動——
+// 使用者 2026-11-11 匯入配息後就是看到帳戶餘額加了、可用現金沒動。
+function fundOffset(acc) {
+  const bal = state.accountBalanceBaseline[acc];
+  const cash = state.accountCashBaseline[acc];
+  return (bal != null && cash != null) ? bal - cash : 0;
+}
+
 function effectiveCash(acc) {
   const ov = state.accountFinance[acc].cash;
   if (ov != null) return ov;
-  // xlsx 的 E2 口徑優先，**不是** B2。可橙戶頭的 B2（帳戶餘額）含「基金存款」，
-  // 那筆錢鎖在定期定額基金裡不能買股票，E2 把它扣掉；而週記帳的「即時庫存」
-  // C 欄用的就是 E2。拿 B2 當可用現金會讓「當週損益」的比較基準固定多算一整筆
-  // 基金存款（實測可橙 32,543，每週都在）。我的戶頭沒這一欄，E2 = B2。
-  //
-  // 刻意不理帳戶餘額的手動覆寫值：那是 B2 口徑的數字，差額（基金存款）不會
-  // 因為使用者改了餘額而改變，硬套只會把那筆錢加回來。覆寫可用現金請用
-  // 可用現金自己的欄位。
-  const base = state.accountCashBaseline[acc];
-  if (base != null) return base + currentWeekTxNet(acc);
-  // 讀不到 E2（直接開檔、或公式解不出來）才退回帳戶餘額，維持舊行為。
   const bal = effectiveBalance(acc);
   if (bal == null) return null;
-  return bal + currentWeekTxNet(acc);
+  // 扣掉基金存款：那筆錢鎖在定期定額基金裡不能買股票，而週記帳的「即時庫存」
+  // C 欄用的是 E2（已扣）。不扣的話「當週損益」的比較基準會固定多算一整筆
+  // （實測可橙 32,543，每週都在、不會自己消失）。
+  return bal + currentWeekTxNet(acc) - fundOffset(acc);
 }
 
 // 未入帳配息：手動覆寫值優先，否則退回 xlsx 標示「(未入帳)」左邊讀到的基準值。
